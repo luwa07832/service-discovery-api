@@ -3,11 +3,15 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+// ErrInstanceNotFound reports that a targeted instance does not exist.
+var ErrInstanceNotFound = errors.New("instance not found")
 
 // Store wraps the SQLite handle so callers never touch database/sql directly.
 type Store struct {
@@ -33,6 +37,13 @@ type InstanceInput struct {
 	Port        int64
 	Healthy     bool
 	Weight      float64
+	HeartbeatAt time.Time
+}
+
+// HeartbeatTarget carries one heartbeat renewal in a batch: the existing
+// instance identified by InstanceID gets only its HeartbeatAt replaced.
+type HeartbeatTarget struct {
+	InstanceID  string
 	HeartbeatAt time.Time
 }
 
@@ -161,6 +172,62 @@ DELETE FROM service_instances WHERE service_name = ? AND instance_id = ?`, servi
 		return false, err
 	}
 	return affected > 0, nil
+}
+
+// TouchHeartbeats replaces only heartbeat_at of the named service's
+// instances. The whole batch runs in one transaction: when any target does
+// not exist the transaction rolls back and ErrInstanceNotFound is returned
+// without partial updates. Updated records are returned in request order.
+func (s *Store) TouchHeartbeats(serviceName string, targets []HeartbeatTarget) ([]Instance, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	statement, err := tx.Prepare(`
+UPDATE service_instances SET heartbeat_at = ?
+WHERE service_name = ? AND instance_id = ?`)
+	if err != nil {
+		return nil, err
+	}
+	defer statement.Close()
+
+	for _, target := range targets {
+		result, err := statement.Exec(
+			target.HeartbeatAt.UTC().Format(time.RFC3339Nano), serviceName, target.InstanceID)
+		if err != nil {
+			return nil, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if affected == 0 {
+			return nil, ErrInstanceNotFound
+		}
+	}
+
+	updated := make([]Instance, 0, len(targets))
+	for _, target := range targets {
+		row := tx.QueryRow(`
+SELECT service_name, instance_id, address, port, healthy, weight, heartbeat_at
+FROM service_instances
+WHERE service_name = ? AND instance_id = ?`, serviceName, target.InstanceID)
+		instance, err := scanInstance(row)
+		if err == sql.ErrNoRows {
+			return nil, ErrInstanceNotFound
+		}
+		if err != nil {
+			return nil, err
+		}
+		updated = append(updated, instance)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return updated, nil
 }
 
 type rowScanner interface {

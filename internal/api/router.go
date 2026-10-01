@@ -13,6 +13,7 @@ import (
 var emptyServicePaths = []*regexp.Regexp{
 	regexp.MustCompile(`^/api/v1/services/(/instances)?/?$`),
 	regexp.MustCompile(`^/api/v1/services/(/discover)/?$`),
+	regexp.MustCompile(`^/api/v1/services/(/instances/[^/]+/heartbeat)/?$`),
 }
 
 // Server wires the store to every public HTTP entry point.
@@ -63,6 +64,11 @@ func NewRouter(st *store.Store) *gin.Engine {
 	router.DELETE("/api/v1/instances", server.handleDelete)
 	router.POST("/api/v1/deregister", server.handleDelete)
 
+	// Heartbeat renewal: only heartbeat_at is replaced; the caller never
+	// resubmits address, port, health state or weight.
+	router.POST("/api/v1/services/:serviceName/instances/:instanceId/heartbeat", server.handleHeartbeat)
+	router.POST("/api/v1/heartbeat", server.handleBatchHeartbeat)
+
 	// Discovery of healthy instances with heartbeat-lost removal.
 	router.GET("/api/v1/services/:serviceName/discover", server.handleDiscover)
 	router.GET("/api/v1/discover", server.handleDiscover)
@@ -78,6 +84,8 @@ func NewRouter(st *store.Store) *gin.Engine {
 				switch {
 				case strings.HasSuffix(c.Request.URL.Path, "/discover"):
 					server.handleDiscover(c)
+				case strings.HasSuffix(c.Request.URL.Path, "/heartbeat"):
+					server.handleHeartbeat(c)
 				case c.Request.Method == http.MethodDelete || (c.Request.Method == http.MethodPost && strings.HasSuffix(c.Request.URL.Path, "/delete")):
 					server.handleDelete(c)
 				case c.Request.Method == http.MethodPost:

@@ -1,7 +1,9 @@
 package api
 
 import (
+	"errors"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -146,6 +148,132 @@ func (s *Server) handleDelete(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"deleted": true, "service_name": serviceName, "instance_id": instanceID})
+}
+
+// handleHeartbeat renews heartbeat_at of one path-addressed instance. The
+// caller does not resubmit address, port, health state or weight: only
+// heartbeat_at is replaced and every other field keeps its current value.
+func (s *Server) handleHeartbeat(c *gin.Context) {
+	bag, apiErr := buildParamBag(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	instanceID, apiErr := bag.requiredText(instanceIDKeys, "instance_id must not be empty")
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	heartbeatAt, apiErr := requireHeartbeat(bag)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	updated, err := s.store.TouchHeartbeats(serviceName, []store.HeartbeatTarget{
+		{InstanceID: instanceID, HeartbeatAt: heartbeatAt},
+	})
+	if apiErr := mapHeartbeatError(err); apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	c.JSON(200, gin.H{"instance": instanceJSON(updated[0])})
+}
+
+// handleBatchHeartbeat renews heartbeat_at for several instances of one
+// service. Every entry is validated before any write, so a missing, empty,
+// duplicated or malformed request changes no record.
+func (s *Server) handleBatchHeartbeat(c *gin.Context) {
+	bag, apiErr := buildParamBag(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	rawEntries, ok := bag.get([]string{"instances"})
+	if !ok {
+		writeError(c, errInvalidParameter("instances must be a non-empty list"))
+		return
+	}
+	entries, ok := rawEntries.([]any)
+	if !ok || len(entries) == 0 {
+		writeError(c, errInvalidParameter("instances must be a non-empty list"))
+		return
+	}
+	targets := make([]store.HeartbeatTarget, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, rawEntry := range entries {
+		entry, ok := rawEntry.(map[string]any)
+		if !ok {
+			writeError(c, errInvalidParameter("each instance must be an object"))
+			return
+		}
+		instanceID := strings.TrimSpace(stringValue(entry["instance_id"]))
+		if instanceID == "" {
+			writeError(c, errInvalidParameter("instance_id must not be empty"))
+			return
+		}
+		if _, duplicated := seen[instanceID]; duplicated {
+			writeError(c, errInvalidParameter("instance_id must not be duplicated"))
+			return
+		}
+		heartbeatValue, present := entry["heartbeat_at"]
+		if !present {
+			writeError(c, errInvalidParameter("heartbeat_at is required"))
+			return
+		}
+		heartbeatAt, parsed := parseTimeValue(heartbeatValue)
+		if !parsed {
+			writeError(c, errInvalidParameter("heartbeat_at must be a valid timestamp"))
+			return
+		}
+		seen[instanceID] = struct{}{}
+		targets = append(targets, store.HeartbeatTarget{
+			InstanceID:  instanceID,
+			HeartbeatAt: heartbeatAt,
+		})
+	}
+	updated, err := s.store.TouchHeartbeats(serviceName, targets)
+	if apiErr := mapHeartbeatError(err); apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	instances := make([]gin.H, 0, len(updated))
+	for _, instance := range updated {
+		instances = append(instances, instanceJSON(instance))
+	}
+	c.JSON(200, gin.H{"updated": len(instances), "instances": instances})
+}
+
+func requireHeartbeat(bag *paramBag) (time.Time, *apiError) {
+	heartbeatValue, ok := bag.get(heartbeatKeys)
+	if !ok {
+		return time.Time{}, errInvalidParameter("heartbeat_at is required")
+	}
+	heartbeatAt, ok := parseTimeValue(heartbeatValue)
+	if !ok {
+		return time.Time{}, errInvalidParameter("heartbeat_at must be a valid timestamp")
+	}
+	return heartbeatAt, nil
+}
+
+func mapHeartbeatError(err error) *apiError {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, store.ErrInstanceNotFound):
+		return errInstanceNotFound()
+	default:
+		return errStorageUnavailable()
+	}
 }
 
 func (s *Server) loadInstance(c *gin.Context) (store.Instance, *apiError) {

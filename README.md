@@ -79,6 +79,60 @@ go run .
 删除另有 `POST /api/v1/services/{serviceName}/instances/{instanceId}/delete`
 与 `POST /api/v1/deregister`。
 
+### 心跳续期
+
+- 单实例：`POST /api/v1/services/{serviceName}/instances/{instanceId}/heartbeat`
+- 批量：`POST /api/v1/heartbeat`
+
+续期只需要提交 `heartbeat_at`（与注册入口一致，接受 RFC3339 时间或 Unix 秒），
+不必重复提交地址、端口、健康状态和权重；这些字段保持当前值不变。
+
+单实例请求体示例：
+
+```json
+{"heartbeat_at": "2026-10-01T12:05:00Z"}
+```
+
+成功返回 HTTP 200 与完整实例记录：
+
+```json
+{"instance":{"service_name":"billing","instance_id":"i-1","address":"10.0.0.8:8080","port":8080,"healthy":true,"weight":10,"heartbeat_at":"2026-10-01T12:05:00Z"}}
+```
+
+批量请求体含非空 `service_name` 与非空 `instances`，每项含非空、不重复的
+`instance_id` 与可解析的 `heartbeat_at`：
+
+```json
+{
+  "service_name": "billing",
+  "instances": [
+    {"instance_id": "i-1", "heartbeat_at": "2026-10-01T12:05:00Z"},
+    {"instance_id": "i-2", "heartbeat_at": 1759320300}
+  ]
+}
+```
+
+成功返回 HTTP 200，`updated` 为更新条数，`instances` 中每项都是完整实例记录，
+并严格按请求顺序返回：
+
+```json
+{
+  "updated": 2,
+  "instances": [
+    {"service_name":"billing","instance_id":"i-1","address":"10.0.0.8:8080","port":8080,"healthy":true,"weight":10,"heartbeat_at":"2026-10-01T12:05:00Z"},
+    {"service_name":"billing","instance_id":"i-2","address":"10.0.0.9:8080","port":8080,"healthy":false,"weight":5,"heartbeat_at":"2025-10-01T12:05:00Z"}
+  ]
+}
+```
+
+批量写入前校验全部条目：`service_name` 为空、`instances` 缺失或为空、
+条目里的 `instance_id` 为空或重复、`heartbeat_at` 缺失或无法解析，
+都返回 HTTP 400 `invalid_parameter`，且不更新任何记录。
+目标实例不存在时（单实例或批量中的任一条目）返回 HTTP 404
+`instance_not_found`，批量也不做部分更新；存储失败返回 HTTP 503
+`storage_unavailable`，同样不留下部分更新。
+续期不改变未命中记录，也不改变后续发现请求的失联判定与清理行为。
+
 ### 按服务名发现健康实例
 
 - `GET|POST /api/v1/services/{serviceName}/discover`

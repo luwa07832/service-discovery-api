@@ -152,3 +152,69 @@ VALUES ('svc', 'i', '10.0.0.1', 1, 3, '2026-10-01T12:00:00Z');`); err != nil {
 		t.Fatalf("port after upsert = %d", got.Port)
 	}
 }
+
+func TestTouchHeartbeatsUpdatesOnlyHeartbeatInRequestOrder(t *testing.T) {
+	st := openTestStore(t)
+	heartbeat := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	seed := InstanceInput{
+		ServiceName: "svc", Address: "10.0.0.1:8080", Port: 8080,
+		Healthy: true, Weight: 7, HeartbeatAt: heartbeat,
+	}
+	first := seed
+	first.InstanceID = "i-1"
+	second := seed
+	second.InstanceID = "i-2"
+	if _, err := st.UpsertInstance(first); err != nil {
+		t.Fatalf("upsert i-1: %v", err)
+	}
+	if _, err := st.UpsertInstance(second); err != nil {
+		t.Fatalf("upsert i-2: %v", err)
+	}
+	other := seed
+	other.ServiceName = "svc-other"
+	other.InstanceID = "i-2"
+	if _, err := st.UpsertInstance(other); err != nil {
+		t.Fatalf("upsert other: %v", err)
+	}
+
+	renewed := heartbeat.Add(5 * time.Minute)
+	updated, err := st.TouchHeartbeats("svc", []HeartbeatTarget{
+		{InstanceID: "i-2", HeartbeatAt: renewed},
+		{InstanceID: "i-1", HeartbeatAt: renewed.Add(time.Second)},
+	})
+	if err != nil {
+		t.Fatalf("touch: %v", err)
+	}
+	if len(updated) != 2 || updated[0].InstanceID != "i-2" || updated[1].InstanceID != "i-1" {
+		t.Fatalf("updated order = %+v", updated)
+	}
+	got, _, _ := st.GetInstance("svc", "i-1")
+	if got.Address != "10.0.0.1:8080" || got.Port != 8080 || !got.Healthy ||
+		got.Weight != 7 || !got.HeartbeatAt.Equal(renewed.Add(time.Second)) {
+		t.Fatalf("non-heartbeat fields changed: %+v", got)
+	}
+	if peer, _, _ := st.GetInstance("svc-other", "i-2"); !peer.HeartbeatAt.Equal(heartbeat) {
+		t.Fatalf("other service heartbeat changed: %+v", peer)
+	}
+}
+
+func TestTouchHeartbeatsMissingInstanceRollsBack(t *testing.T) {
+	st := openTestStore(t)
+	heartbeat := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	if _, err := st.UpsertInstance(InstanceInput{
+		ServiceName: "svc", InstanceID: "i-1", Weight: 1, HeartbeatAt: heartbeat,
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	_, err := st.TouchHeartbeats("svc", []HeartbeatTarget{
+		{InstanceID: "i-1", HeartbeatAt: heartbeat.Add(time.Minute)},
+		{InstanceID: "missing", HeartbeatAt: heartbeat.Add(2 * time.Minute)},
+	})
+	if err != ErrInstanceNotFound {
+		t.Fatalf("err = %v, want ErrInstanceNotFound", err)
+	}
+	if got, _, _ := st.GetInstance("svc", "i-1"); !got.HeartbeatAt.Equal(heartbeat) {
+		t.Fatalf("batch was not rolled back: %+v", got)
+	}
+}
