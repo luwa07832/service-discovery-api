@@ -8,12 +8,14 @@ import (
 	"github.com/luwa07832/service-discovery-api/internal/store"
 )
 
-// NewRouter wires the public HTTP surface. Only the health entry is published today; the service
-// contract in README.md describes the error shape every entry must keep.
+// NewRouter wires the public HTTP surface. Every entry keeps the error shape the
+// service contract in README.md describes.
 func NewRouter(st *store.Store) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(gin.Recovery())
+
+	registerInstanceRoutes(router, st)
 
 	router.GET("/healthz", func(c *gin.Context) {
 		if err := st.Ping(); err != nil {

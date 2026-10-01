@@ -41,4 +41,14 @@ CREATE TABLE IF NOT EXISTS service_metadata (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS service_instances (
+	service_name  TEXT    NOT NULL,
+	instance_id   TEXT    NOT NULL,
+	address       TEXT    NOT NULL,
+	healthy       INTEGER NOT NULL,
+	weight        REAL    NOT NULL CHECK (weight >= 0),
+	heartbeat_ns  INTEGER NOT NULL,
+	PRIMARY KEY (service_name, instance_id)
+);
 `
