@@ -2,6 +2,8 @@ package api
 
 import (
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -16,10 +18,16 @@ func jsonWeight(weight float64) any {
 	return weight
 }
 
+func joinAddress(host string, port int) string {
+	return host + ":" + strconv.Itoa(port)
+}
+
 func instanceJSON(instance store.Instance) gin.H {
 	return gin.H{
 		"service_name": instance.ServiceName,
 		"instance_id":  instance.InstanceID,
+		"host":         instance.Host,
+		"port":         instance.Port,
 		"address":      instance.Address,
 		"healthy":      instance.Healthy,
 		"weight":       jsonWeight(instance.Weight),
@@ -27,15 +35,144 @@ func instanceJSON(instance store.Instance) gin.H {
 	}
 }
 
-// handleUpsert stores a registration or an update for one service instance.
-// Repeating the same (service name, instance id) pair overwrites the record.
+func parseRequestAt(bag *paramBag) (time.Time, *apiError) {
+	value, ok := bag.get(requestAtKeys)
+	if !ok {
+		return time.Time{}, errInvalidParameter("request time is required")
+	}
+	requestAt, valid := parseTimeValue(value)
+	if !valid {
+		return time.Time{}, errInvalidParameter("request time must be a valid timestamp")
+	}
+	return requestAt.UTC(), nil
+}
+
+// parseRegistration reads and validates every registration field. The request
+// time anchors the initial heartbeat: an explicit heartbeat later than it is a
+// parameter error, and a missing heartbeat defaults to the request time.
+func parseRegistration(bag *paramBag) (store.Instance, *apiError) {
+	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	if apiErr != nil {
+		return store.Instance{}, apiErr
+	}
+	instanceID, apiErr := bag.requiredText(instanceIDKeys, "instance_id must not be empty")
+	if apiErr != nil {
+		return store.Instance{}, apiErr
+	}
+
+	host := ""
+	if hostValue, ok := bag.get(hostKeys); ok {
+		host = strings.TrimSpace(stringValue(hostValue))
+	}
+	port, hasPort := 0, false
+	if rawPort, ok := bag.get(portKeys); ok {
+		parsedPort, valid := portValue(rawPort)
+		if !valid {
+			return store.Instance{}, errInvalidParameter("port must be an integer between 0 and 65535")
+		}
+		port, hasPort = parsedPort, true
+	}
+	// Fall back to the legacy "host:port" address field when host or port is
+	// not provided explicitly.
+	if host == "" || !hasPort {
+		if addressValue, ok := bag.get(addressKeys); ok {
+			fallbackHost, fallbackPort, parsed := splitHostPort(stringValue(addressValue))
+			if parsed {
+				if host == "" {
+					host = fallbackHost
+				}
+				if !hasPort {
+					port, hasPort = fallbackPort, true
+				}
+			}
+		}
+	}
+	if host == "" {
+		return store.Instance{}, errInvalidParameter("host must not be empty")
+	}
+	if !hasPort {
+		return store.Instance{}, errInvalidParameter("port is required")
+	}
+
+	weightValue, ok := bag.get(weightKeys)
+	if !ok {
+		return store.Instance{}, errInvalidParameter("weight must be greater than zero")
+	}
+	weight, ok := positiveNumber(weightValue)
+	if !ok {
+		return store.Instance{}, errInvalidParameter("weight must be greater than zero")
+	}
+
+	healthy := false
+	if healthValue, present := bag.get(healthKeys); present {
+		healthy, ok = parseHealthValue(healthValue)
+		if !ok {
+			return store.Instance{}, errInvalidParameter("healthy must be a boolean health state")
+		}
+	}
+
+	requestAt, apiErr := parseRequestAt(bag)
+	if apiErr != nil {
+		return store.Instance{}, apiErr
+	}
+	heartbeatAt := requestAt
+	if heartbeatValue, present := bag.get(heartbeatKeys); present {
+		parsed, valid := parseTimeValue(heartbeatValue)
+		if !valid {
+			return store.Instance{}, errInvalidParameter("heartbeat_at must be a valid timestamp")
+		}
+		heartbeatAt = parsed
+	}
+	if heartbeatAt.After(requestAt) {
+		return store.Instance{}, errInvalidParameter("heartbeat_at must not be later than request time")
+	}
+
+	return store.Instance{
+		ServiceName: serviceName,
+		InstanceID:  instanceID,
+		Host:        host,
+		Port:        port,
+		Address:     joinAddress(host, port),
+		Healthy:     healthy,
+		Weight:      weight,
+		HeartbeatAt: heartbeatAt.UTC(),
+	}, nil
+}
+
+// handleUpsert stores a registration, overwriting the record of the same
+// (service name, instance id) pair. The response reports whether the pair was
+// already registered together with the current record.
 func (s *Server) handleUpsert(c *gin.Context) {
 	bag, apiErr := buildParamBag(c)
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
 	}
+	instance, apiErr := parseRegistration(bag)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	saved, alreadyRegistered, err := s.store.UpsertInstance(instance)
+	if err != nil {
+		writeError(c, errStorageUnavailable())
+		return
+	}
+	c.JSON(200, gin.H{
+		"registered":         true,
+		"already_registered": alreadyRegistered,
+		"instance":           instanceJSON(saved),
+	})
+}
 
+// handleHeartbeat applies a health/weight/heartbeat update to an existing
+// instance. Unknown instances report updated=false and are never created.
+func (s *Server) handleHeartbeat(c *gin.Context) {
+	bag, apiErr := buildParamBag(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
 	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
 	if apiErr != nil {
 		writeError(c, apiErr)
@@ -46,68 +183,74 @@ func (s *Server) handleUpsert(c *gin.Context) {
 		writeError(c, apiErr)
 		return
 	}
-	weightValue, ok := bag.get(weightKeys)
-	if !ok {
-		writeError(c, errInvalidParameter("weight must be a non-negative number"))
-		return
-	}
-	weight, ok := nonNegativeNumber(weightValue)
-	if !ok {
-		writeError(c, errInvalidParameter("weight must be a non-negative number"))
-		return
-	}
-	heartbeatValue, ok := bag.get(heartbeatKeys)
-	if !ok {
-		writeError(c, errInvalidParameter("heartbeat_at is required"))
-		return
-	}
-	heartbeatAt, ok := parseTimeValue(heartbeatValue)
-	if !ok {
-		writeError(c, errInvalidParameter("heartbeat_at must be a valid timestamp"))
-		return
-	}
 
-	healthy := false
-	if healthValue, ok := bag.get(healthKeys); ok {
-		healthy, ok = parseHealthValue(healthValue)
-		if !ok {
+	healthy, hasHealth := false, false
+	if healthValue, present := bag.get(healthKeys); present {
+		parsed, valid := parseHealthValue(healthValue)
+		if !valid {
 			writeError(c, errInvalidParameter("healthy must be a boolean health state"))
 			return
 		}
+		healthy, hasHealth = parsed, true
 	}
-	address := ""
-	if addressValue, ok := bag.get(addressKeys); ok {
-		address = stringValue(addressValue)
-	}
-
-	// evaluate_at is optional on registrations. The clock-skew guard rejects a
-	// heartbeat later than the caller's evaluation point.
-	if evaluateValue, ok := bag.get(evaluateAtKeys); ok {
-		evaluateAt, parsed := parseTimeValue(evaluateValue)
-		if !parsed {
-			writeError(c, errInvalidParameter("evaluate_at must be a valid timestamp"))
+	weight, hasWeight := 0.0, false
+	if weightValue, present := bag.get(weightKeys); present {
+		parsed, valid := positiveNumber(weightValue)
+		if !valid {
+			writeError(c, errInvalidParameter("weight must be greater than zero"))
 			return
 		}
-		if evaluateAt.Before(heartbeatAt) {
-			writeError(c, errInvalidParameter("evaluate_at must not be earlier than heartbeat_at"))
-			return
-		}
+		weight, hasWeight = parsed, true
 	}
 
-	input := store.InstanceInput{
-		ServiceName: serviceName,
-		InstanceID:  instanceID,
-		Address:     address,
-		Healthy:     healthy,
-		Weight:      weight,
-		HeartbeatAt: heartbeatAt,
-	}
-	instance, err := s.store.UpsertInstance(input)
-	if err != nil {
-		writeError(c, errStorageUnavailable())
+	requestAt, apiErr := parseRequestAt(bag)
+	if apiErr != nil {
+		writeError(c, apiErr)
 		return
 	}
-	c.JSON(200, gin.H{"instance": instanceJSON(instance)})
+	heartbeatAt := requestAt
+	if heartbeatValue, present := bag.get(heartbeatKeys); present {
+		parsed, valid := parseTimeValue(heartbeatValue)
+		if !valid {
+			writeError(c, errInvalidParameter("heartbeat_at must be a valid timestamp"))
+			return
+		}
+		heartbeatAt = parsed
+	}
+	if heartbeatAt.After(requestAt) {
+		writeError(c, errInvalidParameter("heartbeat_at must not be later than request time"))
+		return
+	}
+
+	// A single atomic call reports unknown instances as updated=false and
+	// never creates a record; omitted fields keep their current values.
+	var healthPtr *bool
+	if hasHealth {
+		healthPtr = &healthy
+	}
+	var weightPtr *float64
+	if hasWeight {
+		weightPtr = &weight
+	}
+	updated, found := s.store.UpdateInstance(serviceName, instanceID, store.InstanceUpdate{
+		Healthy:     healthPtr,
+		Weight:      weightPtr,
+		HeartbeatAt: heartbeatAt.UTC(),
+	})
+	if !found {
+		c.JSON(200, gin.H{
+			"updated":      false,
+			"service_name": serviceName,
+			"instance_id":  instanceID,
+		})
+		return
+	}
+	c.JSON(200, gin.H{
+		"updated":      true,
+		"service_name": serviceName,
+		"instance_id":  instanceID,
+		"instance":     instanceJSON(updated),
+	})
 }
 
 func (s *Server) handleDelete(c *gin.Context) {
@@ -161,7 +304,6 @@ func (s *Server) loadInstance(c *gin.Context) (store.Instance, *apiError) {
 	return instance, nil
 }
 
-// handleGetInstance serves the full record query entry.
 func (s *Server) handleGetInstance(c *gin.Context) {
 	instance, apiErr := s.loadInstance(c)
 	if apiErr != nil {
@@ -252,8 +394,30 @@ func (s *Server) handleListInstances(c *gin.Context) {
 	c.JSON(200, gin.H{"service_name": serviceName, "instances": results})
 }
 
-// handleDiscover implements the new discovery entry: unhealthy and heartbeat
-// lost instances are removed from the candidate set for this query only.
+// parseDiscoveryMoment reads the evaluation time and heartbeat timeout shared
+// by discovery and cleanup requests.
+func parseDiscoveryMoment(bag *paramBag) (time.Time, time.Duration, *apiError) {
+	evaluateValue, ok := bag.get(evaluateAtKeys)
+	if !ok {
+		return time.Time{}, 0, errInvalidParameter("evaluate_at is required")
+	}
+	evaluateAt, ok := parseTimeValue(evaluateValue)
+	if !ok {
+		return time.Time{}, 0, errInvalidParameter("evaluate_at must be a valid timestamp")
+	}
+	timeoutValue, ok := bag.get(timeoutKeys)
+	if !ok {
+		return time.Time{}, 0, errInvalidParameter("heartbeat_timeout must be greater than zero")
+	}
+	timeout, ok := parseTimeout(timeoutValue)
+	if !ok || timeout <= 0 {
+		return time.Time{}, 0, errInvalidParameter("heartbeat_timeout must be greater than zero")
+	}
+	return evaluateAt.UTC(), timeout, nil
+}
+
+// handleDiscover returns the service's healthy instances that have not been
+// lost. Discovery never mutates records; use handleCleanup to reap lost ones.
 func (s *Server) handleDiscover(c *gin.Context) {
 	bag, apiErr := buildParamBag(c)
 	if apiErr != nil {
@@ -265,24 +429,9 @@ func (s *Server) handleDiscover(c *gin.Context) {
 		writeError(c, apiErr)
 		return
 	}
-	evaluateValue, ok := bag.get(evaluateAtKeys)
-	if !ok {
-		writeError(c, errInvalidParameter("evaluate_at is required"))
-		return
-	}
-	evaluateAt, ok := parseTimeValue(evaluateValue)
-	if !ok {
-		writeError(c, errInvalidParameter("evaluate_at must be a valid timestamp"))
-		return
-	}
-	timeoutValue, ok := bag.get(timeoutKeys)
-	if !ok {
-		writeError(c, errInvalidParameter("heartbeat_timeout must be greater than zero"))
-		return
-	}
-	timeout, ok := parseTimeout(timeoutValue)
-	if !ok || timeout <= 0 {
-		writeError(c, errInvalidParameter("heartbeat_timeout must be greater than zero"))
+	evaluateAt, timeout, apiErr := parseDiscoveryMoment(bag)
+	if apiErr != nil {
+		writeError(c, apiErr)
 		return
 	}
 
@@ -294,14 +443,12 @@ func (s *Server) handleDiscover(c *gin.Context) {
 	deadline := evaluateAt.Add(-timeout)
 	candidates := make([]gin.H, 0, len(instances))
 	for _, instance := range instances {
-		if evaluateAt.Before(instance.HeartbeatAt) {
-			writeError(c, errInvalidParameter("evaluate_at must not be earlier than heartbeat_at"))
-			return
-		}
 		if !instance.Healthy {
 			continue
 		}
-		if !instance.HeartbeatAt.After(deadline) {
+		// Only a heartbeat strictly earlier than the deadline counts as
+		// lost; one at exactly the deadline stays discoverable.
+		if instance.HeartbeatAt.Before(deadline) {
 			continue
 		}
 		candidates = append(candidates, instanceJSON(instance))
@@ -315,8 +462,38 @@ func (s *Server) handleDiscover(c *gin.Context) {
 	})
 }
 
-// sortInstances orders by weight descending, heartbeat newest first, then
-// instance id ascending, giving deterministic output for identical input.
+// handleCleanup removes every instance of the service whose heartbeat is
+// earlier than evaluate_at minus the timeout and returns the deleted ids.
+// Discovery and cleanup are separate entries; cleanup is the only one that
+// deletes records.
+func (s *Server) handleCleanup(c *gin.Context) {
+	bag, apiErr := buildParamBag(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	evaluateAt, timeout, apiErr := parseDiscoveryMoment(bag)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+
+	removed := s.store.RemoveLost(serviceName, evaluateAt, timeout)
+	c.JSON(200, gin.H{
+		"service_name":         serviceName,
+		"evaluate_at":          evaluateAt.Format(time.RFC3339Nano),
+		"heartbeat_timeout":    jsonWeight(timeout.Seconds()),
+		"deleted_instance_ids": removed,
+	})
+}
+
+// sortInstances orders by weight descending and instance id ascending, giving
+// deterministic output for identical input.
 func sortInstances(instances []gin.H) {
 	sort.SliceStable(instances, func(i, j int) bool {
 		left, right := instances[i], instances[j]
@@ -324,11 +501,6 @@ func sortInstances(instances []gin.H) {
 		rightWeight, _ := toFloat(right["weight"])
 		if leftWeight != rightWeight {
 			return leftWeight > rightWeight
-		}
-		leftHeartbeat, _ := parseTimeValue(left["heartbeat_at"])
-		rightHeartbeat, _ := parseTimeValue(right["heartbeat_at"])
-		if !leftHeartbeat.Equal(rightHeartbeat) {
-			return leftHeartbeat.After(rightHeartbeat)
 		}
 		return stringValue(left["instance_id"]) < stringValue(right["instance_id"])
 	})

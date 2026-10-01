@@ -45,6 +45,13 @@ func NewRouter(st *store.Store) *gin.Engine {
 	router.POST("/api/v1/instances", server.handleUpsert)
 	router.PUT("/api/v1/instances", server.handleUpsert)
 
+	// Heartbeat updates only touch already-registered instances.
+	router.POST("/api/v1/services/:serviceName/instances/:instanceId/heartbeat", server.handleHeartbeat)
+	router.PUT("/api/v1/services/:serviceName/instances/:instanceId/heartbeat", server.handleHeartbeat)
+	router.POST("/api/v1/heartbeat", server.handleHeartbeat)
+	router.PUT("/api/v1/heartbeat", server.handleHeartbeat)
+	router.POST("/api/v1/heartbeats", server.handleHeartbeat)
+
 	// Public instance query entries.
 	router.GET("/api/v1/services/:serviceName/instances", server.handleListInstances)
 	router.GET("/api/v1/services/:serviceName/instances/:instanceId", server.handleGetInstance)
@@ -69,6 +76,10 @@ func NewRouter(st *store.Store) *gin.Engine {
 	router.POST("/api/v1/services/:serviceName/discover", server.handleDiscover)
 	router.POST("/api/v1/discover", server.handleDiscover)
 
+	// Cleanup reaps heartbeat-lost instances of one service.
+	router.POST("/api/v1/services/:serviceName/cleanup", server.handleCleanup)
+	router.POST("/api/v1/cleanup", server.handleCleanup)
+
 	router.NoRoute(func(c *gin.Context) {
 		// An empty final path segment (e.g. /api/v1/services//instances)
 		// carries an empty service name and must be a parameter error.
@@ -78,6 +89,8 @@ func NewRouter(st *store.Store) *gin.Engine {
 				switch {
 				case strings.HasSuffix(c.Request.URL.Path, "/discover"):
 					server.handleDiscover(c)
+				case strings.HasSuffix(c.Request.URL.Path, "/cleanup"):
+					server.handleCleanup(c)
 				case c.Request.Method == http.MethodDelete || (c.Request.Method == http.MethodPost && strings.HasSuffix(c.Request.URL.Path, "/delete")):
 					server.handleDelete(c)
 				case c.Request.Method == http.MethodPost:

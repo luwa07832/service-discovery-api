@@ -14,12 +14,10 @@ func main() {
 	if address == "" {
 		address = "127.0.0.1:8080"
 	}
-	databasePath := os.Getenv("DB_PATH")
-	if databasePath == "" {
-		databasePath = "service-discovery-api.db"
-	}
 
-	st, err := store.Open(databasePath)
+	// The registry is in-process only: nothing is read from or written to
+	// disk, so no database path is needed.
+	st, err := store.Open("")
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}

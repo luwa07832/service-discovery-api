@@ -18,7 +18,10 @@ import (
 var (
 	serviceNameKeys = []string{"service_name", "serviceName", "service"}
 	instanceIDKeys  = []string{"instance_id", "instanceId", "instance", "id"}
-	addressKeys     = []string{"address", "addr", "host", "endpoint"}
+	hostKeys        = []string{"host", "hostname", "host_address"}
+	portKeys        = []string{"port"}
+	addressKeys     = []string{"address", "addr", "endpoint"}
+	requestAtKeys   = []string{"request_at", "request_time", "requested_at", "now", "at"}
 	healthKeys      = []string{"health", "healthy", "status", "state"}
 	weightKeys      = []string{"weight"}
 	heartbeatKeys   = []string{"heartbeat_at", "heartbeatAt", "heartbeat", "heartbeat_time", "heartbeatTime", "last_heartbeat"}
@@ -33,7 +36,7 @@ type apiError struct {
 }
 
 func errInvalidParameter(message string) *apiError {
-	return &apiError{http.StatusBadRequest, "invalid_parameter", message}
+	return &apiError{http.StatusBadRequest, "INVALID_ARGUMENT", message}
 }
 
 func errInstanceNotFound() *apiError {
@@ -115,12 +118,40 @@ func (b *paramBag) requiredText(keys []string, message string) (string, *apiErro
 	return text, nil
 }
 
-func nonNegativeNumber(value any) (float64, bool) {
+// positiveNumber accepts a finite number strictly greater than zero. A zero
+// or negative weight is an invalid argument and leaves the record untouched.
+func positiveNumber(value any) (float64, bool) {
 	number, ok := toFloat(value)
-	if !ok || math.IsNaN(number) || math.IsInf(number, 0) || number < 0 {
+	if !ok || math.IsNaN(number) || math.IsInf(number, 0) || number <= 0 {
 		return 0, false
 	}
 	return number, true
+}
+
+// portValue parses a TCP port: an integer in the valid port range.
+func portValue(value any) (int, bool) {
+	number, ok := toFloat(value)
+	if !ok || math.IsNaN(number) || math.IsInf(number, 0) {
+		return 0, false
+	}
+	if number < 0 || number > 65535 || number != math.Trunc(number) {
+		return 0, false
+	}
+	return int(number), true
+}
+
+// splitHostPort extracts the host and port from a "host:port" address. It is
+// used only as a fallback when a request carries the legacy address field.
+func splitHostPort(address string) (string, int, bool) {
+	host, portText, ok := strings.Cut(strings.TrimSpace(address), ":")
+	if !ok || host == "" {
+		return "", 0, false
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(portText))
+	if err != nil || port < 0 || port > 65535 {
+		return "", 0, false
+	}
+	return host, port, true
 }
 
 func toFloat(value any) (float64, bool) {
@@ -149,21 +180,18 @@ func toFloat(value any) (float64, bool) {
 }
 
 func parseHealthValue(value any) (bool, bool) {
-	switch typed := value.(type) {
-	case bool:
+	// Only an explicit boolean state is accepted: JSON true/false in bodies
+	// and the text "true"/"false" in query parameters. Any other value
+	// (numbers, "healthy"/"unhealthy" text, etc.) is an invalid argument so
+	// different implementations cannot disagree on the resulting state.
+	if typed, ok := value.(bool); ok {
 		return typed, true
-	case float64:
-		switch typed {
-		case 1:
+	}
+	if typed, ok := value.(string); ok {
+		switch strings.TrimSpace(typed) {
+		case "true":
 			return true, true
-		case 0:
-			return false, true
-		}
-	case string:
-		switch strings.ToLower(strings.TrimSpace(typed)) {
-		case "healthy", "up", "on", "true", "1", "yes":
-			return true, true
-		case "unhealthy", "down", "off", "false", "0", "no":
+		case "false":
 			return false, true
 		}
 	}

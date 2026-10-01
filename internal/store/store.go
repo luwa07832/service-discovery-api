@@ -1,179 +1,165 @@
-// Package store owns the SQLite file and every write the service performs.
+// Package store owns the in-process instance registry used by the service.
+// Records live only in memory: the service never writes a database file or
+// any other durable state.
 package store
 
 import (
-	"database/sql"
-	"fmt"
+	"sort"
+	"sync"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
-
-// Store wraps the SQLite handle so callers never touch database/sql directly.
-type Store struct {
-	db *sql.DB
-}
 
 // Instance is the current record of one registered service instance.
 type Instance struct {
 	ServiceName string
 	InstanceID  string
+	Host        string
+	Port        int
 	Address     string
 	Healthy     bool
 	Weight      float64
 	HeartbeatAt time.Time
 }
 
-// InstanceInput carries the fields callers provide on registration or update.
-type InstanceInput struct {
-	ServiceName string
-	InstanceID  string
-	Address     string
-	Healthy     bool
-	Weight      float64
+// Store is the in-process registry of service instances.
+type Store struct {
+	mu        sync.RWMutex
+	instances map[string]map[string]Instance
+}
+
+// Open creates an empty in-process registry. The path is accepted for
+// compatibility with the previous file-backed entry point but is never used:
+// this store keeps no durable state.
+func Open(_ string) (*Store, error) {
+	return &Store{instances: make(map[string]map[string]Instance)}, nil
+}
+
+// Ping reports whether the in-process registry is usable.
+func (s *Store) Ping() error { return nil }
+
+// Close releases the in-process registry.
+func (s *Store) Close() error { return nil }
+
+// UpsertInstance records a registration, overwriting the current record of
+// the same (service name, instance id) pair. It reports whether an instance
+// with that pair was already registered.
+func (s *Store) UpsertInstance(instance Instance) (Instance, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	group := s.instances[instance.ServiceName]
+	if group == nil {
+		group = make(map[string]Instance)
+		s.instances[instance.ServiceName] = group
+	}
+	_, existed := group[instance.InstanceID]
+	group[instance.InstanceID] = instance
+	return instance, existed, nil
+}
+
+// InstanceUpdate carries the fields of a heartbeat update. Nil pointers mean
+// the current value of that field must be preserved.
+type InstanceUpdate struct {
+	Healthy     *bool
+	Weight      *float64
 	HeartbeatAt time.Time
 }
 
-// Open prepares the database file and the schema this service needs.
-func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
-	}
-	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("enable wal: %w", err)
-	}
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("apply schema: %w", err)
-	}
-	return &Store{db: db}, nil
-}
+// UpdateInstance applies a heartbeat update to an existing instance. Lookup
+// and write happen under one lock so a concurrent delete cannot be observed
+// as a storage failure. It returns false without creating a record when the
+// instance is unknown.
+func (s *Store) UpdateInstance(serviceName, instanceID string, update InstanceUpdate) (Instance, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-// Ping reports whether the storage layer is usable.
-func (s *Store) Ping() error { return s.db.Ping() }
-
-// Close releases the database handle.
-func (s *Store) Close() error { return s.db.Close() }
-
-// UpsertInstance inserts an instance record or overwrites the current record
-// of the same (service name, instance id) pair.
-func (s *Store) UpsertInstance(input InstanceInput) (Instance, error) {
-	heartbeat := input.HeartbeatAt.UTC().Format(time.RFC3339Nano)
-	_, err := s.db.Exec(`
-INSERT INTO service_instances
-	(service_name, instance_id, address, healthy, weight, heartbeat_at)
-VALUES (?, ?, ?, ?, ?, ?)
-ON CONFLICT(service_name, instance_id) DO UPDATE SET
-	address = excluded.address,
-	healthy = excluded.healthy,
-	weight = excluded.weight,
-	heartbeat_at = excluded.heartbeat_at`,
-		input.ServiceName, input.InstanceID, input.Address, input.Healthy, input.Weight, heartbeat)
-	if err != nil {
-		return Instance{}, err
+	group := s.instances[serviceName]
+	if group == nil {
+		return Instance{}, false
 	}
-	return Instance{
-		ServiceName: input.ServiceName,
-		InstanceID:  input.InstanceID,
-		Address:     input.Address,
-		Healthy:     input.Healthy,
-		Weight:      input.Weight,
-		HeartbeatAt: input.HeartbeatAt.UTC(),
-	}, nil
+	current, ok := group[instanceID]
+	if !ok {
+		return Instance{}, false
+	}
+	if update.Healthy != nil {
+		current.Healthy = *update.Healthy
+	}
+	if update.Weight != nil {
+		current.Weight = *update.Weight
+	}
+	current.HeartbeatAt = update.HeartbeatAt
+	group[instanceID] = current
+	return current, true
 }
 
 // GetInstance reads the current record of one instance.
 func (s *Store) GetInstance(serviceName, instanceID string) (Instance, bool, error) {
-	row := s.db.QueryRow(`
-SELECT service_name, instance_id, address, healthy, weight, heartbeat_at
-FROM service_instances
-WHERE service_name = ? AND instance_id = ?`, serviceName, instanceID)
-	instance, err := scanInstance(row)
-	if err == sql.ErrNoRows {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	group := s.instances[serviceName]
+	if group == nil {
 		return Instance{}, false, nil
 	}
-	if err != nil {
-		return Instance{}, false, err
-	}
-	return instance, true, nil
+	instance, ok := group[instanceID]
+	return instance, ok, nil
 }
 
 // ListInstances reads every current record belonging to one service. Other
 // services are never touched or removed.
 func (s *Store) ListInstances(serviceName string) ([]Instance, error) {
-	rows, err := s.db.Query(`
-SELECT service_name, instance_id, address, healthy, weight, heartbeat_at
-FROM service_instances
-WHERE service_name = ?`, serviceName)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	instances := make([]Instance, 0)
-	for rows.Next() {
-		instance, err := scanInstance(rows)
-		if err != nil {
-			return nil, err
-		}
+	group := s.instances[serviceName]
+	instances := make([]Instance, 0, len(group))
+	for _, instance := range group {
 		instances = append(instances, instance)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
+	sort.Slice(instances, func(i, j int) bool {
+		return instances[i].InstanceID < instances[j].InstanceID
+	})
 	return instances, nil
 }
 
 // DeleteInstance removes one instance record and reports whether it existed.
 func (s *Store) DeleteInstance(serviceName, instanceID string) (bool, error) {
-	result, err := s.db.Exec(`
-DELETE FROM service_instances WHERE service_name = ? AND instance_id = ?`, serviceName, instanceID)
-	if err != nil {
-		return false, err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	group := s.instances[serviceName]
+	if group == nil {
+		return false, nil
 	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, err
+	if _, ok := group[instanceID]; !ok {
+		return false, nil
 	}
-	return affected > 0, nil
+	delete(group, instanceID)
+	if len(group) == 0 {
+		delete(s.instances, serviceName)
+	}
+	return true, nil
 }
 
-type rowScanner interface {
-	Scan(dest ...any) error
-}
+// RemoveLost deletes every instance of the service whose heartbeat is strictly
+// earlier than evaluateAt minus timeout, returning the deleted instance ids.
+// Health state does not protect an instance from this reaper.
+func (s *Store) RemoveLost(serviceName string, evaluateAt time.Time, timeout time.Duration) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-func scanInstance(scanner rowScanner) (Instance, error) {
-	var instance Instance
-	var healthy int
-	var heartbeat string
-	if err := scanner.Scan(&instance.ServiceName, &instance.InstanceID, &instance.Address,
-		&healthy, &instance.Weight, &heartbeat); err != nil {
-		return Instance{}, err
+	group := s.instances[serviceName]
+	deadline := evaluateAt.Add(-timeout)
+	removed := make([]string, 0)
+	for instanceID, instance := range group {
+		if instance.HeartbeatAt.Before(deadline) {
+			delete(group, instanceID)
+			removed = append(removed, instanceID)
+		}
 	}
-	parsed, err := time.Parse(time.RFC3339Nano, heartbeat)
-	if err != nil {
-		return Instance{}, err
+	if len(group) == 0 {
+		delete(s.instances, serviceName)
 	}
-	instance.Healthy = healthy != 0
-	instance.HeartbeatAt = parsed
-	return instance, nil
+	sort.Strings(removed)
+	return removed
 }
-
-const schema = `
-CREATE TABLE IF NOT EXISTS service_metadata (
-	key   TEXT PRIMARY KEY,
-	value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS service_instances (
-	service_name TEXT NOT NULL,
-	instance_id  TEXT NOT NULL,
-	address      TEXT NOT NULL DEFAULT '',
-	healthy      INTEGER NOT NULL DEFAULT 0,
-	weight       REAL NOT NULL DEFAULT 0,
-	heartbeat_at TEXT NOT NULL,
-	PRIMARY KEY(service_name, instance_id)
-);
-`
