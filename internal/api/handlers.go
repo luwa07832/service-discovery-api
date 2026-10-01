@@ -21,6 +21,7 @@ func instanceJSON(instance store.Instance) gin.H {
 		"service_name": instance.ServiceName,
 		"instance_id":  instance.InstanceID,
 		"address":      instance.Address,
+		"port":         instance.Port,
 		"healthy":      instance.Healthy,
 		"weight":       jsonWeight(instance.Weight),
 		"heartbeat_at": instance.HeartbeatAt.Format(time.RFC3339Nano),
@@ -48,13 +49,21 @@ func (s *Server) handleUpsert(c *gin.Context) {
 	}
 	weightValue, ok := bag.get(weightKeys)
 	if !ok {
-		writeError(c, errInvalidParameter("weight must be a non-negative number"))
+		writeError(c, errInvalidParameter("weight must be a positive number"))
 		return
 	}
-	weight, ok := nonNegativeNumber(weightValue)
+	weight, ok := positiveNumber(weightValue)
 	if !ok {
-		writeError(c, errInvalidParameter("weight must be a non-negative number"))
+		writeError(c, errInvalidParameter("weight must be a positive number"))
 		return
+	}
+	port := int64(0)
+	if portValue, present := bag.get(portKeys); present {
+		port, ok = parsePortValue(portValue)
+		if !ok {
+			writeError(c, errInvalidParameter("port must be a non-negative integer"))
+			return
+		}
 	}
 	heartbeatValue, ok := bag.get(heartbeatKeys)
 	if !ok {
@@ -69,9 +78,9 @@ func (s *Server) handleUpsert(c *gin.Context) {
 
 	healthy := false
 	if healthValue, ok := bag.get(healthKeys); ok {
-		healthy, ok = parseHealthValue(healthValue)
+		healthy, ok = strictBoolValue(healthValue)
 		if !ok {
-			writeError(c, errInvalidParameter("healthy must be a boolean health state"))
+			writeError(c, errInvalidParameter("healthy must be a boolean true or false"))
 			return
 		}
 	}
@@ -98,6 +107,7 @@ func (s *Server) handleUpsert(c *gin.Context) {
 		ServiceName: serviceName,
 		InstanceID:  instanceID,
 		Address:     address,
+		Port:        port,
 		Healthy:     healthy,
 		Weight:      weight,
 		HeartbeatAt: heartbeatAt,
@@ -252,8 +262,11 @@ func (s *Server) handleListInstances(c *gin.Context) {
 	c.JSON(200, gin.H{"service_name": serviceName, "instances": results})
 }
 
-// handleDiscover implements the new discovery entry: unhealthy and heartbeat
-// lost instances are removed from the candidate set for this query only.
+// handleDiscover implements the weighted discovery entry: only explicitly
+// healthy instances whose last heartbeat is not strictly past the lost
+// boundary are returned. An instance exactly on the boundary is still
+// online. Records strictly past the boundary are removed by the lost
+// cleanup; online and unhealthy-but-fresh records are never touched.
 func (s *Server) handleDiscover(c *gin.Context) {
 	bag, apiErr := buildParamBag(c)
 	if apiErr != nil {
@@ -291,27 +304,52 @@ func (s *Server) handleDiscover(c *gin.Context) {
 		writeError(c, errStorageUnavailable())
 		return
 	}
-	deadline := evaluateAt.Add(-timeout)
-	candidates := make([]gin.H, 0, len(instances))
 	for _, instance := range instances {
 		if evaluateAt.Before(instance.HeartbeatAt) {
 			writeError(c, errInvalidParameter("evaluate_at must not be earlier than heartbeat_at"))
 			return
 		}
-		if !instance.Healthy {
+	}
+	candidates := make([]gin.H, 0, len(instances))
+	lost := make([]store.Instance, 0)
+	for _, instance := range instances {
+		if evaluateAt.After(instance.HeartbeatAt.Add(timeout)) {
+			lost = append(lost, instance)
 			continue
 		}
-		if !instance.HeartbeatAt.After(deadline) {
+		if !instance.Healthy {
 			continue
 		}
 		candidates = append(candidates, instanceJSON(instance))
 	}
-	sortInstances(candidates)
+	// Lost cleanup deletes records strictly past the timeout. It runs only
+	// after the request is fully validated, so a rejected query changes
+	// nothing.
+	for _, instance := range lost {
+		if _, err := s.store.DeleteInstance(instance.ServiceName, instance.InstanceID); err != nil {
+			writeError(c, errStorageUnavailable())
+			return
+		}
+	}
+	sortDiscoverHits(candidates)
 	c.JSON(200, gin.H{
 		"service_name":      serviceName,
 		"evaluate_at":       evaluateAt.Format(time.RFC3339Nano),
 		"heartbeat_timeout": jsonWeight(timeout.Seconds()),
 		"instances":         candidates,
+	})
+}
+
+// sortDiscoverHits orders discovery hits by weight descending, then instance
+// id ascending, giving deterministic output for identical input.
+func sortDiscoverHits(instances []gin.H) {
+	sort.SliceStable(instances, func(i, j int) bool {
+		leftWeight, _ := toFloat(instances[i]["weight"])
+		rightWeight, _ := toFloat(instances[j]["weight"])
+		if leftWeight != rightWeight {
+			return leftWeight > rightWeight
+		}
+		return stringValue(instances[i]["instance_id"]) < stringValue(instances[j]["instance_id"])
 	})
 }
 

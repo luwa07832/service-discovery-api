@@ -19,6 +19,7 @@ type Instance struct {
 	ServiceName string
 	InstanceID  string
 	Address     string
+	Port        int64
 	Healthy     bool
 	Weight      float64
 	HeartbeatAt time.Time
@@ -29,6 +30,7 @@ type InstanceInput struct {
 	ServiceName string
 	InstanceID  string
 	Address     string
+	Port        int64
 	Healthy     bool
 	Weight      float64
 	HeartbeatAt time.Time
@@ -48,7 +50,26 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate schema: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// migrate upgrades database files created by earlier versions in place.
+func migrate(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(
+		`SELECT COUNT(1) FROM pragma_table_info('service_instances') WHERE name = 'port'`).Scan(&count); err != nil {
+		return err
+	}
+	if count == 0 {
+		if _, err := db.Exec(`ALTER TABLE service_instances ADD COLUMN port INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Ping reports whether the storage layer is usable.
@@ -63,14 +84,15 @@ func (s *Store) UpsertInstance(input InstanceInput) (Instance, error) {
 	heartbeat := input.HeartbeatAt.UTC().Format(time.RFC3339Nano)
 	_, err := s.db.Exec(`
 INSERT INTO service_instances
-	(service_name, instance_id, address, healthy, weight, heartbeat_at)
-VALUES (?, ?, ?, ?, ?, ?)
+	(service_name, instance_id, address, port, healthy, weight, heartbeat_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(service_name, instance_id) DO UPDATE SET
 	address = excluded.address,
+	port = excluded.port,
 	healthy = excluded.healthy,
 	weight = excluded.weight,
 	heartbeat_at = excluded.heartbeat_at`,
-		input.ServiceName, input.InstanceID, input.Address, input.Healthy, input.Weight, heartbeat)
+		input.ServiceName, input.InstanceID, input.Address, input.Port, input.Healthy, input.Weight, heartbeat)
 	if err != nil {
 		return Instance{}, err
 	}
@@ -78,6 +100,7 @@ ON CONFLICT(service_name, instance_id) DO UPDATE SET
 		ServiceName: input.ServiceName,
 		InstanceID:  input.InstanceID,
 		Address:     input.Address,
+		Port:        input.Port,
 		Healthy:     input.Healthy,
 		Weight:      input.Weight,
 		HeartbeatAt: input.HeartbeatAt.UTC(),
@@ -87,7 +110,7 @@ ON CONFLICT(service_name, instance_id) DO UPDATE SET
 // GetInstance reads the current record of one instance.
 func (s *Store) GetInstance(serviceName, instanceID string) (Instance, bool, error) {
 	row := s.db.QueryRow(`
-SELECT service_name, instance_id, address, healthy, weight, heartbeat_at
+SELECT service_name, instance_id, address, port, healthy, weight, heartbeat_at
 FROM service_instances
 WHERE service_name = ? AND instance_id = ?`, serviceName, instanceID)
 	instance, err := scanInstance(row)
@@ -104,7 +127,7 @@ WHERE service_name = ? AND instance_id = ?`, serviceName, instanceID)
 // services are never touched or removed.
 func (s *Store) ListInstances(serviceName string) ([]Instance, error) {
 	rows, err := s.db.Query(`
-SELECT service_name, instance_id, address, healthy, weight, heartbeat_at
+SELECT service_name, instance_id, address, port, healthy, weight, heartbeat_at
 FROM service_instances
 WHERE service_name = ?`, serviceName)
 	if err != nil {
@@ -149,7 +172,7 @@ func scanInstance(scanner rowScanner) (Instance, error) {
 	var healthy int
 	var heartbeat string
 	if err := scanner.Scan(&instance.ServiceName, &instance.InstanceID, &instance.Address,
-		&healthy, &instance.Weight, &heartbeat); err != nil {
+		&instance.Port, &healthy, &instance.Weight, &heartbeat); err != nil {
 		return Instance{}, err
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, heartbeat)
@@ -171,6 +194,7 @@ CREATE TABLE IF NOT EXISTS service_instances (
 	service_name TEXT NOT NULL,
 	instance_id  TEXT NOT NULL,
 	address      TEXT NOT NULL DEFAULT '',
+	port         INTEGER NOT NULL DEFAULT 0,
 	healthy      INTEGER NOT NULL DEFAULT 0,
 	weight       REAL NOT NULL DEFAULT 0,
 	heartbeat_at TEXT NOT NULL,

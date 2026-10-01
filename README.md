@@ -51,6 +51,7 @@ go run .
   "service_name": "billing",
   "instance_id": "i-1",
   "address": "10.0.0.8:8080",
+  "port": 8080,
   "healthy": true,
   "weight": 10,
   "heartbeat_at": "2026-10-01T12:00:00Z"
@@ -59,8 +60,9 @@ go run .
 
 - `service_name`、`instance_id`：必填非空。
 - `address`：访问地址，可选，默认空字符串。
-- `healthy`：健康状态，接受布尔值或 `healthy`/`unhealthy` 等文本，缺省按 `false` 处理。
-- `weight`：权重，必填的非负数（JSON 数字或数字字符串）。
+- `port`：端口，可选的非负整数，缺省为 `0`。
+- `healthy`：健康状态，显式设置时只接受布尔 `true` 或 `false`，其他取值返回 `invalid_parameter`，缺省按 `false` 处理。
+- `weight`：权重，必填且必须大于 0（JSON 数字或数字字符串），小于等于 0 返回 `invalid_parameter` 且原记录不变。
 - `heartbeat_at`：心跳时间，必填，接受 RFC3339 时间或 Unix 秒。
 
 ### 公开查询
@@ -88,17 +90,18 @@ go run .
 不可用判定（只针对该服务名下的实例，其他服务记录不变）：
 
 - 健康状态不是健康；
-- 心跳时间早于或等于 `evaluate_at - heartbeat_timeout`。
+- 心跳时间严格超过失联边界：仅当 `evaluate_at` 晚于 `heartbeat_at + heartbeat_timeout` 时判定失联，等于边界仍视为在线。
 
-失联实例只从本次查询的候选集合中剔除，数据库中的实例记录不被删除、不被修改。
+失联实例从本次查询的候选集合中剔除，且失联清理流程会删除严格超过时限的记录；仍在线的实例以及显式不健康但未超时的记录不被删除、不被修改。
 服务名下没有实例，或剔除后没有候选实例，统一返回空列表 `[]`。
-返回项包含 `instance_id`、`address`、`healthy`、`weight`、`heartbeat_at`，
-排序规则固定为：权重由高到低；权重相同则心跳时间由新到旧；
-再相同则按实例标识升序，保证同一输入输出顺序确定。
+返回项包含 `instance_id`、`address`、`port`、`healthy`、`weight`、`heartbeat_at`，
+排序规则固定为：权重由高到低；权重相同则按实例标识升序，
+保证同一输入输出顺序确定。
 
 ## 参数错误
 
-`service_name` 为空、`instance_id` 为空、`weight` 缺失或不是非负数、
+`service_name` 为空、`instance_id` 为空、`weight` 缺失或不大于 0、
+显式 `healthy` 不是布尔 `true`/`false`、
 `heartbeat_at` 缺失或无法解析，以及发现请求中 `heartbeat_timeout` 不大于零、
 `evaluate_at` 缺失或早于（任一相关）实例心跳时间，统一返回 HTTP 400，
 并且不创建、不更新、不删除任何实例记录：
@@ -112,4 +115,4 @@ go run .
 所有错误响应都是单个顶层 `error` 对象，包含 `code` 与 `message` 两个字符串字段；`message` 不包含 SQL、堆栈或文件路径。
 
 实现只使用上述 SQLite 存储：没有额外持久化文件、后台清理任务或额外数据源；
-发现过程中的失联剔除仅是查询时过滤。
+发现请求触发的失联清理由请求同步完成，仅删除该服务名下严格超过时限的记录。

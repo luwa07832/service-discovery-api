@@ -19,6 +19,7 @@ var (
 	serviceNameKeys = []string{"service_name", "serviceName", "service"}
 	instanceIDKeys  = []string{"instance_id", "instanceId", "instance", "id"}
 	addressKeys     = []string{"address", "addr", "host", "endpoint"}
+	portKeys        = []string{"port"}
 	healthKeys      = []string{"health", "healthy", "status", "state"}
 	weightKeys      = []string{"weight"}
 	heartbeatKeys   = []string{"heartbeat_at", "heartbeatAt", "heartbeat", "heartbeat_time", "heartbeatTime", "last_heartbeat"}
@@ -115,12 +116,30 @@ func (b *paramBag) requiredText(keys []string, message string) (string, *apiErro
 	return text, nil
 }
 
-func nonNegativeNumber(value any) (float64, bool) {
+// positiveNumber accepts weights: only numbers strictly greater than zero.
+func positiveNumber(value any) (float64, bool) {
 	number, ok := toFloat(value)
-	if !ok || math.IsNaN(number) || math.IsInf(number, 0) || number < 0 {
+	if !ok || math.IsNaN(number) || math.IsInf(number, 0) || number <= 0 {
 		return 0, false
 	}
 	return number, true
+}
+
+// parsePortValue accepts a non-negative integer port number.
+func parsePortValue(value any) (int64, bool) {
+	number, ok := toFloat(value)
+	if !ok || math.IsNaN(number) || math.IsInf(number, 0) || number < 0 ||
+		number != math.Trunc(number) || number > math.MaxInt64 {
+		return 0, false
+	}
+	return int64(number), true
+}
+
+// strictBoolValue accepts only JSON boolean true or false. Every other
+// representation (text, numbers) is rejected so all implementations agree.
+func strictBoolValue(value any) (bool, bool) {
+	typed, ok := value.(bool)
+	return typed, ok
 }
 
 func toFloat(value any) (float64, bool) {
