@@ -4,6 +4,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -11,6 +12,26 @@ import (
 // Store wraps the SQLite handle so callers never touch database/sql directly.
 type Store struct {
 	db *sql.DB
+}
+
+// Instance is the current record of one registered service instance.
+type Instance struct {
+	ServiceName string
+	InstanceID  string
+	Address     string
+	Healthy     bool
+	Weight      float64
+	HeartbeatAt time.Time
+}
+
+// InstanceInput carries the fields callers provide on registration or update.
+type InstanceInput struct {
+	ServiceName string
+	InstanceID  string
+	Address     string
+	Healthy     bool
+	Weight      float64
+	HeartbeatAt time.Time
 }
 
 // Open prepares the database file and the schema this service needs.
@@ -36,9 +57,123 @@ func (s *Store) Ping() error { return s.db.Ping() }
 // Close releases the database handle.
 func (s *Store) Close() error { return s.db.Close() }
 
+// UpsertInstance inserts an instance record or overwrites the current record
+// of the same (service name, instance id) pair.
+func (s *Store) UpsertInstance(input InstanceInput) (Instance, error) {
+	heartbeat := input.HeartbeatAt.UTC().Format(time.RFC3339Nano)
+	_, err := s.db.Exec(`
+INSERT INTO service_instances
+	(service_name, instance_id, address, healthy, weight, heartbeat_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(service_name, instance_id) DO UPDATE SET
+	address = excluded.address,
+	healthy = excluded.healthy,
+	weight = excluded.weight,
+	heartbeat_at = excluded.heartbeat_at`,
+		input.ServiceName, input.InstanceID, input.Address, input.Healthy, input.Weight, heartbeat)
+	if err != nil {
+		return Instance{}, err
+	}
+	return Instance{
+		ServiceName: input.ServiceName,
+		InstanceID:  input.InstanceID,
+		Address:     input.Address,
+		Healthy:     input.Healthy,
+		Weight:      input.Weight,
+		HeartbeatAt: input.HeartbeatAt.UTC(),
+	}, nil
+}
+
+// GetInstance reads the current record of one instance.
+func (s *Store) GetInstance(serviceName, instanceID string) (Instance, bool, error) {
+	row := s.db.QueryRow(`
+SELECT service_name, instance_id, address, healthy, weight, heartbeat_at
+FROM service_instances
+WHERE service_name = ? AND instance_id = ?`, serviceName, instanceID)
+	instance, err := scanInstance(row)
+	if err == sql.ErrNoRows {
+		return Instance{}, false, nil
+	}
+	if err != nil {
+		return Instance{}, false, err
+	}
+	return instance, true, nil
+}
+
+// ListInstances reads every current record belonging to one service. Other
+// services are never touched or removed.
+func (s *Store) ListInstances(serviceName string) ([]Instance, error) {
+	rows, err := s.db.Query(`
+SELECT service_name, instance_id, address, healthy, weight, heartbeat_at
+FROM service_instances
+WHERE service_name = ?`, serviceName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	instances := make([]Instance, 0)
+	for rows.Next() {
+		instance, err := scanInstance(rows)
+		if err != nil {
+			return nil, err
+		}
+		instances = append(instances, instance)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return instances, nil
+}
+
+// DeleteInstance removes one instance record and reports whether it existed.
+func (s *Store) DeleteInstance(serviceName, instanceID string) (bool, error) {
+	result, err := s.db.Exec(`
+DELETE FROM service_instances WHERE service_name = ? AND instance_id = ?`, serviceName, instanceID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanInstance(scanner rowScanner) (Instance, error) {
+	var instance Instance
+	var healthy int
+	var heartbeat string
+	if err := scanner.Scan(&instance.ServiceName, &instance.InstanceID, &instance.Address,
+		&healthy, &instance.Weight, &heartbeat); err != nil {
+		return Instance{}, err
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, heartbeat)
+	if err != nil {
+		return Instance{}, err
+	}
+	instance.Healthy = healthy != 0
+	instance.HeartbeatAt = parsed
+	return instance, nil
+}
+
 const schema = `
 CREATE TABLE IF NOT EXISTS service_metadata (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS service_instances (
+	service_name TEXT NOT NULL,
+	instance_id  TEXT NOT NULL,
+	address      TEXT NOT NULL DEFAULT '',
+	healthy      INTEGER NOT NULL DEFAULT 0,
+	weight       REAL NOT NULL DEFAULT 0,
+	heartbeat_at TEXT NOT NULL,
+	PRIMARY KEY(service_name, instance_id)
 );
 `

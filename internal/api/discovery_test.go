@@ -1,0 +1,451 @@
+package api
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/luwa07832/service-discovery-api/internal/store"
+)
+
+func testRouter(t *testing.T) (http.Handler, *store.Store) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "service.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return NewRouter(st), st
+}
+
+func doRequest(t *testing.T, router http.Handler, method, target string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	var reader *bytes.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		reader = bytes.NewReader(raw)
+	} else {
+		reader = bytes.NewReader(nil)
+	}
+	req := httptest.NewRequest(method, target, reader)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+func registerInstance(t *testing.T, router http.Handler, body map[string]any) {
+	t.Helper()
+	rec := doRequest(t, router, http.MethodPost, "/api/v1/register", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("register %v: status %d body %s", body, rec.Code, rec.Body.String())
+	}
+}
+
+func decodeBody(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode %q: %v", rec.Body.String(), err)
+	}
+	return out
+}
+
+const baseTime = "2026-10-01T12:00:00Z"
+
+func at(minutes int) string {
+	return time.Date(2026, 10, 1, 12, minutes, 0, 0, time.UTC).Format(time.RFC3339)
+}
+
+func instanceIDs(t *testing.T, out map[string]any) []string {
+	t.Helper()
+	rawList, ok := out["instances"].([]any)
+	if !ok {
+		t.Fatalf("instances is not a list: %v", out)
+	}
+	ids := make([]string, 0, len(rawList))
+	for _, raw := range rawList {
+		item := raw.(map[string]any)
+		ids = append(ids, item["instance_id"].(string))
+	}
+	return ids
+}
+
+func expectParameterError(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body %s", rec.Code, rec.Body.String())
+	}
+	out := decodeBody(t, rec)
+	errObj := out["error"].(map[string]any)
+	if errObj["code"] != "invalid_parameter" {
+		t.Fatalf("code = %v, want invalid_parameter", errObj["code"])
+	}
+}
+
+func TestRegisterPersistsAndPublicQueriesReadIt(t *testing.T) {
+	router, st := testRouter(t)
+	body := map[string]any{
+		"service_name": "svc", "instance_id": "i-1", "address": "10.0.0.1:9000",
+		"healthy": true, "weight": 7, "heartbeat_at": baseTime,
+	}
+	registerInstance(t, router, body)
+
+	got, found, err := st.GetInstance("svc", "i-1")
+	if err != nil || !found {
+		t.Fatalf("stored record missing: found=%v err=%v", found, err)
+	}
+	if got.Address != "10.0.0.1:9000" || got.Weight != 7 || !got.Healthy {
+		t.Fatalf("stored record mismatch: %+v", got)
+	}
+
+	for _, target := range []string{
+		"/api/v1/services/svc/instances/i-1",
+		"/api/v1/instances?service_name=svc&instance_id=i-1",
+	} {
+		rec := doRequest(t, router, http.MethodGet, target, nil)
+		if rec.Code != 200 {
+			t.Fatalf("%s: %d %s", target, rec.Code, rec.Body.String())
+		}
+		out := decodeBody(t, rec)
+		instance := out["instance"].(map[string]any)
+		if instance["address"] != "10.0.0.1:9000" || instance["weight"].(float64) != 7 {
+			t.Fatalf("%s unexpected instance %v", target, instance)
+		}
+	}
+
+	health := decodeBody(t, doRequest(t, router, http.MethodGet,
+		"/api/v1/services/svc/instances/i-1/health", nil))
+	if health["healthy"] != true || health["health"] != "healthy" {
+		t.Fatalf("health query mismatch: %v", health)
+	}
+	weight := decodeBody(t, doRequest(t, router, http.MethodGet,
+		"/api/v1/services/svc/instances/i-1/weight", nil))
+	if weight["weight"].(float64) != 7 {
+		t.Fatalf("weight query mismatch: %v", weight)
+	}
+	heartbeat := decodeBody(t, doRequest(t, router, http.MethodGet,
+		"/api/v1/services/svc/instances/i-1/heartbeat", nil))
+	if heartbeat["heartbeat_at"] != baseTime {
+		t.Fatalf("heartbeat query mismatch: %v", heartbeat)
+	}
+}
+
+func TestRepeatedRegistrationOverwritesRecord(t *testing.T) {
+	router, st := testRouter(t)
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc", "instance_id": "i-1", "address": "old",
+		"healthy": true, "weight": 1, "heartbeat_at": at(0),
+	})
+	rec := doRequest(t, router, http.MethodPut,
+		"/api/v1/services/svc/instances/i-1", map[string]any{
+			"address": "new", "healthy": false, "weight": 3, "heartbeat_at": at(5),
+		})
+	if rec.Code != 200 {
+		t.Fatalf("update: %d %s", rec.Code, rec.Body.String())
+	}
+	list, err := st.ListInstances("svc")
+	if err != nil || len(list) != 1 {
+		t.Fatalf("expected one record, got %d err=%v", len(list), err)
+	}
+	if list[0].Address != "new" || list[0].Healthy || list[0].Weight != 3 {
+		t.Fatalf("record not overwritten: %+v", list[0])
+	}
+}
+
+func TestRegisterValidationCreatesNothing(t *testing.T) {
+	router, st := testRouter(t)
+	cases := []map[string]any{
+		{"instance_id": "i", "weight": 1, "heartbeat_at": baseTime},
+		{"service_name": "svc", "weight": 1, "heartbeat_at": baseTime},
+		{"service_name": "svc", "instance_id": "i", "heartbeat_at": baseTime},
+		{"service_name": "svc", "instance_id": "i", "weight": -1, "heartbeat_at": baseTime},
+		{"service_name": "svc", "instance_id": "i", "weight": "abc", "heartbeat_at": baseTime},
+		{"service_name": "svc", "instance_id": "i", "weight": 1},
+		{"service_name": "svc", "instance_id": "i", "weight": 1, "heartbeat_at": "not-a-time"},
+		{"service_name": "svc", "instance_id": "i", "weight": 1, "heartbeat_at": baseTime, "evaluate_at": at(-1)},
+	}
+	for index, body := range cases {
+		rec := doRequest(t, router, http.MethodPost, "/api/v1/register", body)
+		expectParameterError(t, rec)
+		if list, err := st.ListInstances("svc"); err != nil || len(list) != 0 {
+			t.Fatalf("case %d changed storage: %d rows err=%v", index, len(list), err)
+		}
+	}
+}
+
+func TestDiscoverFiltersUnhealthyAndLostInstances(t *testing.T) {
+	router, st := testRouter(t)
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc", "instance_id": "healthy-fresh", "address": "a",
+		"healthy": true, "weight": 1, "heartbeat_at": at(9),
+	})
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc", "instance_id": "healthy-lost", "address": "b",
+		"healthy": true, "weight": 10, "heartbeat_at": at(0),
+	})
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc", "instance_id": "unhealthy-fresh", "address": "c",
+		"healthy": false, "weight": 10, "heartbeat_at": at(9),
+	})
+	registerInstance(t, router, map[string]any{
+		"service_name": "other", "instance_id": "must-not-appear",
+		"healthy": true, "weight": 100, "heartbeat_at": at(9),
+	})
+
+	// evaluate 12:10 with timeout 10m: deadline 12:00; heartbeat at exactly
+	// 12:00 is "earlier than or equal to" the deadline and must be removed.
+	target := "/api/v1/discover?service_name=svc&evaluate_at=" + at(10) + "&heartbeat_timeout=10m"
+	out := decodeBody(t, doRequest(t, router, http.MethodGet, target, nil))
+	ids := instanceIDs(t, out)
+	if len(ids) != 1 || ids[0] != "healthy-fresh" {
+		t.Fatalf("ids = %v, want [healthy-fresh]", ids)
+	}
+
+	// Seconds-style timeout: at 12:10:30 with 60s, heartbeat at 12:09:00 is lost.
+	evaluate := time.Date(2026, 10, 1, 12, 10, 30, 0, time.UTC).Format(time.RFC3339)
+	target = "/api/v1/discover?service_name=svc&evaluate_at=" + evaluate + "&heartbeat_timeout=60"
+	out = decodeBody(t, doRequest(t, router, http.MethodGet, target, nil))
+	if ids := instanceIDs(t, out); len(ids) != 0 {
+		t.Fatalf("seconds timeout ids = %v, want []", ids)
+	}
+
+	// Heartbeat equal to evaluate time survives a timeout larger than zero.
+	target = "/api/v1/discover?service_name=svc&evaluate_at=" + at(9) + "&heartbeat_timeout=1s"
+	out = decodeBody(t, doRequest(t, router, http.MethodGet, target, nil))
+	if ids := instanceIDs(t, out); len(ids) != 1 || ids[0] != "healthy-fresh" {
+		t.Fatalf("boundary ids = %v", ids)
+	}
+
+	// Filtering is query-only: every original record remains stored.
+	list, err := st.ListInstances("svc")
+	if err != nil || len(list) != 3 {
+		t.Fatalf("discovery changed storage: %d rows err=%v", len(list), err)
+	}
+	if other, err := st.ListInstances("other"); err != nil || len(other) != 1 {
+		t.Fatalf("other service changed: %d rows err=%v", len(other), err)
+	}
+}
+
+func TestDiscoverDeterministicOrdering(t *testing.T) {
+	router, _ := testRouter(t)
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc", "instance_id": "low-weight", "healthy": true,
+		"weight": 1, "heartbeat_at": at(9),
+	})
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc", "instance_id": "same-weight-newer", "healthy": true,
+		"weight": 5, "heartbeat_at": at(8),
+	})
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc", "instance_id": "same-weight-older", "healthy": true,
+		"weight": 5, "heartbeat_at": at(5),
+	})
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc", "instance_id": "tie-a", "healthy": true,
+		"weight": 5, "heartbeat_at": at(8),
+	})
+
+	target := "/api/v1/discover?service_name=svc&evaluate_at=" + at(10) + "&heartbeat_timeout=10m"
+	out := decodeBody(t, doRequest(t, router, http.MethodGet, target, nil))
+	ids := instanceIDs(t, out)
+	want := []string{"same-weight-newer", "tie-a", "same-weight-older", "low-weight"}
+	if len(ids) != len(want) {
+		t.Fatalf("ids = %v, want %v", ids, want)
+	}
+	for i := range want {
+		if ids[i] != want[i] {
+			t.Fatalf("ids = %v, want %v", ids, want)
+		}
+	}
+
+	// Result items carry the documented fields.
+	items := out["instances"].([]any)
+	first := items[0].(map[string]any)
+	for _, key := range []string{"instance_id", "address", "healthy", "weight", "heartbeat_at"} {
+		if _, ok := first[key]; !ok {
+			t.Fatalf("result item missing %s: %v", key, first)
+		}
+	}
+}
+
+func TestDiscoverEmptyResults(t *testing.T) {
+	router, _ := testRouter(t)
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc", "instance_id": "i", "healthy": true,
+		"weight": 1, "heartbeat_at": at(0),
+	})
+
+	for _, target := range []string{
+		"/api/v1/discover?service_name=svc&evaluate_at=" + at(10) + "&heartbeat_timeout=1m",
+		"/api/v1/discover?service_name=unknown&evaluate_at=" + at(10) + "&heartbeat_timeout=1m",
+	} {
+		rec := doRequest(t, router, http.MethodGet, target, nil)
+		if rec.Code != 200 {
+			t.Fatalf("%s: %d", target, rec.Code)
+		}
+		out := decodeBody(t, rec)
+		if ids := instanceIDs(t, out); len(ids) != 0 {
+			t.Fatalf("%s ids = %v, want empty", target, ids)
+		}
+	}
+}
+
+func TestDiscoverValidationTouchesNothing(t *testing.T) {
+	router, st := testRouter(t)
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc", "instance_id": "i", "healthy": true,
+		"weight": 1, "heartbeat_at": at(5),
+	})
+	goodEvaluate := at(10)
+	cases := []string{
+		"/api/v1/discover?evaluate_at=" + goodEvaluate + "&heartbeat_timeout=1m",
+		"/api/v1/discover?service_name=svc&heartbeat_timeout=1m",
+		"/api/v1/discover?service_name=svc&evaluate_at=" + goodEvaluate,
+		"/api/v1/discover?service_name=svc&evaluate_at=" + goodEvaluate + "&heartbeat_timeout=0",
+		"/api/v1/discover?service_name=svc&evaluate_at=" + goodEvaluate + "&heartbeat_timeout=-5s",
+		"/api/v1/discover?service_name=svc&evaluate_at=" + at(4) + "&heartbeat_timeout=1m",
+	}
+	for _, target := range cases {
+		rec := doRequest(t, router, http.MethodGet, target, nil)
+		expectParameterError(t, rec)
+		if list, err := st.ListInstances("svc"); err != nil || len(list) != 1 {
+			t.Fatalf("%s changed storage: %d rows err=%v", target, len(list), err)
+		}
+	}
+}
+
+func TestDiscoverIsScopedToService(t *testing.T) {
+	router, _ := testRouter(t)
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc-a", "instance_id": "a1", "healthy": true,
+		"weight": 1, "heartbeat_at": at(9),
+	})
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc-b", "instance_id": "b1", "healthy": true,
+		"weight": 1, "heartbeat_at": at(0),
+	})
+	target := "/api/v1/discover?service_name=svc-a&evaluate_at=" + at(10) + "&heartbeat_timeout=10m"
+	out := decodeBody(t, doRequest(t, router, http.MethodGet, target, nil))
+	if ids := instanceIDs(t, out); len(ids) != 1 || ids[0] != "a1" {
+		t.Fatalf("cross-service leakage: %v", ids)
+	}
+}
+
+func TestDeleteEntryRemovesOnlyNamedInstance(t *testing.T) {
+	router, st := testRouter(t)
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc", "instance_id": "i-1", "healthy": true,
+		"weight": 1, "heartbeat_at": baseTime,
+	})
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc", "instance_id": "i-2", "healthy": true,
+		"weight": 1, "heartbeat_at": baseTime,
+	})
+
+	rec := doRequest(t, router, http.MethodDelete,
+		"/api/v1/services/svc/instances/i-1", nil)
+	if rec.Code != 200 {
+		t.Fatalf("delete: %d %s", rec.Code, rec.Body.String())
+	}
+	if _, found, _ := st.GetInstance("svc", "i-1"); found {
+		t.Fatalf("deleted instance still stored")
+	}
+	if _, found, _ := st.GetInstance("svc", "i-2"); !found {
+		t.Fatalf("sibling instance was removed")
+	}
+
+	rec = doRequest(t, router, http.MethodGet,
+		"/api/v1/services/svc/instances/i-1", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing instance status = %d, want 404", rec.Code)
+	}
+
+	rec = doRequest(t, router, http.MethodDelete,
+		"/api/v1/services/svc/instances/i-1", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("second delete status = %d, want 404", rec.Code)
+	}
+
+	// Invalid delete parameters change nothing.
+	rec = doRequest(t, router, http.MethodPost, "/api/v1/deregister",
+		map[string]any{"service_name": "svc"})
+	expectParameterError(t, rec)
+	if list, _ := st.ListInstances("svc"); len(list) != 1 {
+		t.Fatalf("invalid delete changed storage: %d rows", len(list))
+	}
+}
+
+func TestDiscoverAcceptsJSONBody(t *testing.T) {
+	router, _ := testRouter(t)
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc", "instance_id": "i-1", "healthy": true,
+		"weight": 1, "heartbeat_at": at(9),
+	})
+	rec := doRequest(t, router, http.MethodPost, "/api/v1/discover", map[string]any{
+		"service_name": "svc", "evaluate_at": at(10), "heartbeat_timeout": 300,
+	})
+	if rec.Code != 200 {
+		t.Fatalf("post discover: %d %s", rec.Code, rec.Body.String())
+	}
+	if ids := instanceIDs(t, decodeBody(t, rec)); len(ids) != 1 || ids[0] != "i-1" {
+		t.Fatalf("post discover ids = %v", ids)
+	}
+}
+
+func TestEmptyServiceNamePathIsParameterError(t *testing.T) {
+	router, st := testRouter(t)
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc", "instance_id": "i-1", "healthy": true,
+		"weight": 1, "heartbeat_at": baseTime,
+	})
+	targets := []struct {
+		method string
+		path   string
+		body   any
+	}{
+		{http.MethodPost, "/api/v1/services//instances", map[string]any{
+			"instance_id": "x", "weight": 1, "heartbeat_at": baseTime}},
+		{http.MethodGet, "/api/v1/services//instances", nil},
+		{http.MethodGet, "/api/v1/services//discover?evaluate_at=" + at(10) + "&heartbeat_timeout=1m", nil},
+		{http.MethodDelete, "/api/v1/services//instances/i-1", nil},
+	}
+	for _, item := range targets {
+		rec := doRequest(t, router, item.method, item.path, item.body)
+		expectParameterError(t, rec)
+	}
+	if list, _ := st.ListInstances("svc"); len(list) != 1 {
+		t.Fatalf("empty-name requests changed storage: %d rows", len(list))
+	}
+}
+
+func TestDiscoveryDoesNotDeleteAndListStillShowsAll(t *testing.T) {
+	router, st := testRouter(t)
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc", "instance_id": "lost", "healthy": true,
+		"weight": 10, "heartbeat_at": at(0),
+	})
+	registerInstance(t, router, map[string]any{
+		"service_name": "svc", "instance_id": "fresh", "healthy": true,
+		"weight": 1, "heartbeat_at": at(9),
+	})
+	doRequest(t, router, http.MethodGet,
+		"/api/v1/discover?service_name=svc&evaluate_at="+at(10)+"&heartbeat_timeout=1m", nil)
+
+	list := decodeBody(t, doRequest(t, router, http.MethodGet,
+		"/api/v1/services/svc/instances", nil))
+	if ids := instanceIDs(t, list); len(ids) != 2 {
+		t.Fatalf("public list lost a record after discovery: %v", ids)
+	}
+	stored, err := st.ListInstances("svc")
+	if err != nil || len(stored) != 2 {
+		t.Fatalf("storage rows = %d err=%v", len(stored), err)
+	}
+}
