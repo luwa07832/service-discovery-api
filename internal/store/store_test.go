@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -150,5 +151,53 @@ VALUES ('svc', 'i', '10.0.0.1', 1, 3, '2026-10-01T12:00:00Z');`); err != nil {
 	}
 	if got, _, _ := st.GetInstance("svc", "i"); got.Port != 9000 {
 		t.Fatalf("port after upsert = %d", got.Port)
+	}
+}
+
+func TestRenewHeartbeatsAtomicAndOrdered(t *testing.T) {
+	st := openTestStore(t)
+	first := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	if _, err := st.UpsertInstance(InstanceInput{
+		ServiceName: "svc", InstanceID: "i-1", Address: "a", Port: 1,
+		Healthy: true, Weight: 5, HeartbeatAt: first,
+	}); err != nil {
+		t.Fatalf("upsert i-1: %v", err)
+	}
+	if _, err := st.UpsertInstance(InstanceInput{
+		ServiceName: "svc", InstanceID: "i-2", Address: "b", Port: 2,
+		Healthy: false, Weight: 9, HeartbeatAt: first,
+	}); err != nil {
+		t.Fatalf("upsert i-2: %v", err)
+	}
+
+	newer := first.Add(30 * time.Minute)
+	updated, err := st.RenewHeartbeats("svc", []HeartbeatRenewal{
+		{InstanceID: "i-2", HeartbeatAt: newer},
+		{InstanceID: "i-1", HeartbeatAt: newer.Add(time.Minute)},
+	})
+	if err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+	if len(updated) != 2 || updated[0].InstanceID != "i-2" || updated[1].InstanceID != "i-1" {
+		t.Fatalf("renew order = %+v", updated)
+	}
+	if !updated[0].HeartbeatAt.Equal(newer) || updated[0].Address != "b" ||
+		updated[0].Port != 2 || updated[0].Healthy || updated[0].Weight != 9 {
+		t.Fatalf("renew changed other fields: %+v", updated[0])
+	}
+
+	// A batch naming a missing instance fails and changes nothing.
+	if _, err := st.RenewHeartbeats("svc", []HeartbeatRenewal{
+		{InstanceID: "i-1", HeartbeatAt: newer.Add(2 * time.Minute)},
+		{InstanceID: "ghost", HeartbeatAt: newer},
+	}); !errors.Is(err, ErrInstanceNotFound) {
+		t.Fatalf("missing instance err = %v, want ErrInstanceNotFound", err)
+	}
+	stored, found, err := st.GetInstance("svc", "i-1")
+	if err != nil || !found {
+		t.Fatalf("i-1 missing: found=%v err=%v", found, err)
+	}
+	if !stored.HeartbeatAt.Equal(newer.Add(time.Minute)) {
+		t.Fatalf("failed batch left partial update: %+v", stored)
 	}
 }

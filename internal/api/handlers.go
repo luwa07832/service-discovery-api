@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"sort"
 	"time"
 
@@ -65,14 +66,9 @@ func (s *Server) handleUpsert(c *gin.Context) {
 			return
 		}
 	}
-	heartbeatValue, ok := bag.get(heartbeatKeys)
-	if !ok {
-		writeError(c, errInvalidParameter("heartbeat_at is required"))
-		return
-	}
-	heartbeatAt, ok := parseTimeValue(heartbeatValue)
-	if !ok {
-		writeError(c, errInvalidParameter("heartbeat_at must be a valid timestamp"))
+	heartbeatAt, apiErr := bag.requiredHeartbeat()
+	if apiErr != nil {
+		writeError(c, apiErr)
 		return
 	}
 
@@ -146,6 +142,109 @@ func (s *Server) handleDelete(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"deleted": true, "service_name": serviceName, "instance_id": instanceID})
+}
+
+// renewStoreError maps store renewal failures to the public error shape.
+func renewStoreError(err error) *apiError {
+	if errors.Is(err, store.ErrInstanceNotFound) {
+		return errInstanceNotFound()
+	}
+	return errStorageUnavailable()
+}
+
+// handleRenewHeartbeat refreshes only the heartbeat timestamp of the instance
+// named by the path; every other field keeps its current value.
+func (s *Server) handleRenewHeartbeat(c *gin.Context) {
+	bag, apiErr := buildParamBag(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	instanceID, apiErr := bag.requiredText(instanceIDKeys, "instance_id must not be empty")
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	heartbeatAt, apiErr := bag.requiredHeartbeat()
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	updated, err := s.store.RenewHeartbeats(serviceName, []store.HeartbeatRenewal{
+		{InstanceID: instanceID, HeartbeatAt: heartbeatAt},
+	})
+	if err != nil {
+		writeError(c, renewStoreError(err))
+		return
+	}
+	c.JSON(200, gin.H{"instance": instanceJSON(updated[0])})
+}
+
+// handleRenewHeartbeats refreshes heartbeat timestamps for many instances of
+// one service. Every entry is validated before any write and the store
+// commits the batch atomically, so a rejected request changes nothing.
+func (s *Server) handleRenewHeartbeats(c *gin.Context) {
+	bag, apiErr := buildParamBag(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	itemsValue, ok := bag.get(instancesKeys)
+	if !ok {
+		writeError(c, errInvalidParameter("instances must be a non-empty list"))
+		return
+	}
+	items, ok := itemsValue.([]any)
+	if !ok || len(items) == 0 {
+		writeError(c, errInvalidParameter("instances must be a non-empty list"))
+		return
+	}
+	renewals := make([]store.HeartbeatRenewal, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, raw := range items {
+		fields, ok := raw.(map[string]any)
+		if !ok {
+			writeError(c, errInvalidParameter("instances entries must be JSON objects"))
+			return
+		}
+		entry := &paramBag{values: fields}
+		instanceID, apiErr := entry.requiredText(instanceIDKeys, "instance_id must not be empty")
+		if apiErr != nil {
+			writeError(c, apiErr)
+			return
+		}
+		if _, duplicate := seen[instanceID]; duplicate {
+			writeError(c, errInvalidParameter("instance_id must not contain duplicates"))
+			return
+		}
+		seen[instanceID] = struct{}{}
+		heartbeatAt, apiErr := entry.requiredHeartbeat()
+		if apiErr != nil {
+			writeError(c, apiErr)
+			return
+		}
+		renewals = append(renewals, store.HeartbeatRenewal{InstanceID: instanceID, HeartbeatAt: heartbeatAt})
+	}
+	updated, err := s.store.RenewHeartbeats(serviceName, renewals)
+	if err != nil {
+		writeError(c, renewStoreError(err))
+		return
+	}
+	instances := make([]gin.H, 0, len(updated))
+	for _, instance := range updated {
+		instances = append(instances, instanceJSON(instance))
+	}
+	c.JSON(200, gin.H{"updated": len(updated), "instances": instances})
 }
 
 func (s *Server) loadInstance(c *gin.Context) (store.Instance, *apiError) {

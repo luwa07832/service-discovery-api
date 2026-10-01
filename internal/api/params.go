@@ -25,6 +25,7 @@ var (
 	heartbeatKeys   = []string{"heartbeat_at", "heartbeatAt", "heartbeat", "heartbeat_time", "heartbeatTime", "last_heartbeat"}
 	evaluateAtKeys  = []string{"evaluate_at", "evaluateAt", "at", "now", "evaluate_time", "evaluateTime"}
 	timeoutKeys     = []string{"heartbeat_timeout", "heartbeatTimeout", "timeout", "timeout_seconds", "timeoutSeconds", "heartbeat_timeout_seconds"}
+	instancesKeys   = []string{"instances"}
 )
 
 type apiError struct {
@@ -114,6 +115,20 @@ func (b *paramBag) requiredText(keys []string, message string) (string, *apiErro
 		return "", errInvalidParameter(message)
 	}
 	return text, nil
+}
+
+// requiredHeartbeat reads a mandatory heartbeat timestamp, accepting the same
+// RFC3339 or Unix-second forms as the registration entry.
+func (b *paramBag) requiredHeartbeat() (time.Time, *apiError) {
+	value, ok := b.get(heartbeatKeys)
+	if !ok {
+		return time.Time{}, errInvalidParameter("heartbeat_at is required")
+	}
+	parsed, ok := parseTimeValue(value)
+	if !ok {
+		return time.Time{}, errInvalidParameter("heartbeat_at must be a valid timestamp")
+	}
+	return parsed, nil
 }
 
 // positiveNumber accepts weights: only numbers strictly greater than zero.

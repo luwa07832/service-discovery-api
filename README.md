@@ -65,6 +65,50 @@ go run .
 - `weight`：权重，必填且必须大于 0（JSON 数字或数字字符串），小于等于 0 返回 `invalid_parameter` 且原记录不变。
 - `heartbeat_at`：心跳时间，必填，接受 RFC3339 时间或 Unix 秒。
 
+### 心跳续期
+
+- `POST /api/v1/services/{serviceName}/instances/{instanceId}/heartbeat`
+- `POST /api/v1/heartbeat`（批量）
+
+续期只替换目标实例的 `heartbeat_at`，地址、端口、健康状态与权重保持原值，
+上报方不必重复提交这些字段。单实例续期请求体只含 `heartbeat_at`
+（与注册入口相同，接受 RFC3339 时间或 Unix 秒）：
+
+```json
+{"heartbeat_at": "2026-10-01T12:30:00Z"}
+```
+
+成功返回 HTTP 200 与完整实例记录：
+
+```json
+{"instance":{"service_name":"billing","instance_id":"i-1","address":"10.0.0.8:8080","port":8080,"healthy":true,"weight":10,"heartbeat_at":"2026-10-01T12:30:00Z"}}
+```
+
+批量续期请求体含非空 `service_name` 与非空 `instances`，每项含 `instance_id` 与 `heartbeat_at`：
+
+```json
+{
+  "service_name": "billing",
+  "instances": [
+    {"instance_id": "i-1", "heartbeat_at": "2026-10-01T12:30:00Z"},
+    {"instance_id": "i-2", "heartbeat_at": 1759312800}
+  ]
+}
+```
+
+成功返回 HTTP 200，`updated` 为更新条数，`instances` 按请求顺序返回完整实例记录：
+
+```json
+{"updated":2,"instances":[{"service_name":"billing","instance_id":"i-1","address":"10.0.0.8:8080","port":8080,"healthy":true,"weight":10,"heartbeat_at":"2026-10-01T12:30:00Z"}]}
+```
+
+批量写入前校验全部条目：`service_name`、`instance_id` 为空，`instance_id` 重复，
+`instances` 缺失或为空，`heartbeat_at` 缺失或无法解析，均返回 HTTP 400
+`invalid_parameter` 且不更新任何记录；目标实例不存在时两个入口都返回 HTTP 404
+`instance_not_found`，批量同样不部分更新；存储失败返回 HTTP 503
+`storage_unavailable`。批量续期只改命中实例的 `heartbeat_at`，不影响其他字段、
+未命中记录与后续发现清理行为。
+
 ### 公开查询
 
 - 实例完整记录：`GET /api/v1/services/{serviceName}/instances/{instanceId}`

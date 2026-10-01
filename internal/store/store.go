@@ -3,6 +3,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -33,6 +34,17 @@ type InstanceInput struct {
 	Port        int64
 	Healthy     bool
 	Weight      float64
+	HeartbeatAt time.Time
+}
+
+// ErrInstanceNotFound reports that a write named an instance that is not
+// registered, so the store changed nothing.
+var ErrInstanceNotFound = errors.New("store: instance not found")
+
+// HeartbeatRenewal carries one heartbeat refresh: the instance to touch and
+// the new heartbeat timestamp.
+type HeartbeatRenewal struct {
+	InstanceID  string
 	HeartbeatAt time.Time
 }
 
@@ -161,6 +173,54 @@ DELETE FROM service_instances WHERE service_name = ? AND instance_id = ?`, servi
 		return false, err
 	}
 	return affected > 0, nil
+}
+
+// RenewHeartbeats rewrites only the heartbeat timestamp of the named
+// instances of one service, keeping every other field at its current value.
+// The batch commits atomically: when any named instance is missing the error
+// is ErrInstanceNotFound and no record changes. Returned records follow the
+// request order.
+func (s *Store) RenewHeartbeats(serviceName string, renewals []HeartbeatRenewal) ([]Instance, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	for _, renewal := range renewals {
+		result, err := tx.Exec(`
+UPDATE service_instances SET heartbeat_at = ?
+WHERE service_name = ? AND instance_id = ?`,
+			renewal.HeartbeatAt.UTC().Format(time.RFC3339Nano), serviceName, renewal.InstanceID)
+		if err != nil {
+			return nil, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if affected == 0 {
+			return nil, ErrInstanceNotFound
+		}
+	}
+
+	updated := make([]Instance, 0, len(renewals))
+	for _, renewal := range renewals {
+		row := tx.QueryRow(`
+SELECT service_name, instance_id, address, port, healthy, weight, heartbeat_at
+FROM service_instances
+WHERE service_name = ? AND instance_id = ?`, serviceName, renewal.InstanceID)
+		instance, err := scanInstance(row)
+		if err != nil {
+			return nil, err
+		}
+		updated = append(updated, instance)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return updated, nil
 }
 
 type rowScanner interface {

@@ -63,6 +63,11 @@ func NewRouter(st *store.Store) *gin.Engine {
 	router.DELETE("/api/v1/instances", server.handleDelete)
 	router.POST("/api/v1/deregister", server.handleDelete)
 
+	// Heartbeat renewal rewrites only the heartbeat timestamp of registered
+	// instances; every other field keeps its current value.
+	router.POST("/api/v1/services/:serviceName/instances/:instanceId/heartbeat", server.handleRenewHeartbeat)
+	router.POST("/api/v1/heartbeat", server.handleRenewHeartbeats)
+
 	// Discovery of healthy instances with heartbeat-lost removal.
 	router.GET("/api/v1/services/:serviceName/discover", server.handleDiscover)
 	router.GET("/api/v1/discover", server.handleDiscover)
