@@ -803,6 +803,134 @@ func (s *Server) handleDiscover(c *gin.Context) {
 	})
 }
 
+// handleBatchDiscover implements POST /api/v1/discover/batch: one discovery
+// query across several services that share a single evaluation point and a
+// single heartbeat timeout. Every parameter and every record of the
+// requested services is validated before any deletion, and the lost-instance
+// deletion runs in one transaction across services, so a rejected or failed
+// request creates, updates and deletes nothing. Services outside the request
+// are never read or touched.
+func (s *Server) handleBatchDiscover(c *gin.Context) {
+	bag, apiErr := buildParamBag(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+
+	rawNames, ok := bag.get(serviceNamesKey)
+	if !ok {
+		writeError(c, errInvalidParameter("service_names must be a non-empty list"))
+		return
+	}
+	nameList, ok := rawNames.([]any)
+	if !ok || len(nameList) == 0 {
+		writeError(c, errInvalidParameter("service_names must be a non-empty list"))
+		return
+	}
+	serviceNames := make([]string, 0, len(nameList))
+	seen := make(map[string]struct{}, len(nameList))
+	for _, rawName := range nameList {
+		name, ok := rawName.(string)
+		if !ok {
+			writeError(c, errInvalidParameter("service_names must contain only non-empty names"))
+			return
+		}
+		name = strings.TrimSpace(name)
+		if name == "" {
+			writeError(c, errInvalidParameter("service_names must contain only non-empty names"))
+			return
+		}
+		if _, duplicate := seen[name]; duplicate {
+			writeError(c, errInvalidParameter("service_names must not contain duplicates"))
+			return
+		}
+		seen[name] = struct{}{}
+		serviceNames = append(serviceNames, name)
+	}
+
+	evaluateValue, ok := bag.get(evaluateAtKeys)
+	if !ok {
+		writeError(c, errInvalidParameter("evaluate_at is required"))
+		return
+	}
+	evaluateAt, ok := parseTimeValue(evaluateValue)
+	if !ok {
+		writeError(c, errInvalidParameter("evaluate_at must be a valid timestamp"))
+		return
+	}
+	timeoutValue, ok := bag.get(timeoutKeys)
+	if !ok {
+		writeError(c, errInvalidParameter("heartbeat_timeout must be greater than zero"))
+		return
+	}
+	timeout, ok := parseTimeout(timeoutValue)
+	if !ok || timeout <= 0 {
+		writeError(c, errInvalidParameter("heartbeat_timeout must be greater than zero"))
+		return
+	}
+
+	// Read only the requested services; every other service stays untouched.
+	byService := make(map[string][]store.Instance, len(serviceNames))
+	for _, serviceName := range serviceNames {
+		instances, err := s.store.ListInstances(serviceName)
+		if err != nil {
+			writeError(c, errStorageUnavailable())
+			return
+		}
+		byService[serviceName] = instances
+	}
+	// The clock-skew guard is data validation and must pass for every record
+	// of every requested service before any record is deleted.
+	for _, serviceName := range serviceNames {
+		for _, instance := range byService[serviceName] {
+			if evaluateAt.Before(instance.HeartbeatAt) {
+				writeError(c, errInvalidParameter("evaluate_at must not be earlier than heartbeat_at"))
+				return
+			}
+		}
+	}
+
+	lostKeys := make([]store.InstanceKey, 0)
+	services := make([]gin.H, 0, len(serviceNames))
+	for _, serviceName := range serviceNames {
+		candidates := make([]gin.H, 0, len(byService[serviceName]))
+		for _, instance := range byService[serviceName] {
+			if evaluateAt.After(instance.HeartbeatAt.Add(timeout)) {
+				lostKeys = append(lostKeys, store.InstanceKey{
+					ServiceName: instance.ServiceName,
+					InstanceID:  instance.InstanceID,
+				})
+				continue
+			}
+			if !instance.Healthy {
+				continue
+			}
+			candidates = append(candidates, instanceJSON(instance))
+		}
+		sortDiscoverHits(candidates)
+		services = append(services, gin.H{
+			"service_name": serviceName,
+			"instances":    candidates,
+		})
+	}
+
+	// Lost cleanup deletes records strictly past the timeout across all
+	// requested services in one transaction: a storage failure rolls the
+	// whole batch back and never leaves partial deletions behind.
+	if len(lostKeys) > 0 {
+		if err := s.store.DeleteInstances(lostKeys); err != nil {
+			writeError(c, errStorageUnavailable())
+			return
+		}
+	}
+
+	c.JSON(200, gin.H{
+		"services":          services,
+		"evaluate_at":       evaluateAt.Format(time.RFC3339Nano),
+		"heartbeat_timeout": jsonWeight(timeout.Seconds()),
+	})
+}
+
 // handleCleanup implements the standalone lost-instance cleanup entry. An
 // omitted service_name evaluates every service; an explicit service_name
 // must be non-empty and scopes the cleanup to that one service, leaving

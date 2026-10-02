@@ -254,6 +254,54 @@ HTTP 404 `instance_not_found`，批量整批不生效；存储失败返回 HTTP 
 排序规则固定为：权重由高到低；权重相同则按实例标识升序，
 保证同一输入输出顺序确定。
 
+### 批量发现健康实例
+
+- `POST /api/v1/discover/batch`
+
+一次查询多个服务的健康实例，所有服务共用同一评估时刻与同一超时时长。
+请求体必须是单个 JSON 对象：
+
+```json
+{
+  "service_names": ["billing", "gateway"],
+  "evaluate_at": "2026-10-01T12:10:00Z",
+  "heartbeat_timeout": "5m"
+}
+```
+
+- `service_names`：必填的非空字符串数组；每项去除首尾空白后必须非空且不得重复。
+- `evaluate_at`：评估时刻，必填，接受 RFC3339 时间或 Unix 秒。
+- `heartbeat_timeout`：心跳超时时长，必填且大于零，接受正数秒数或 `30s`、`2m` 时长文本。
+
+失联判定与单服务发现一致：仅当 `evaluate_at` 晚于
+`heartbeat_at + heartbeat_timeout` 时判定失联，恰好等于边界仍视为在线。
+处理只读取请求指定的服务：每个服务只把 `healthy` 为 `true` 且未失联的实例
+放入结果，失联实例按相同边界从对应服务删除；显式不健康但未失联的实例保留，
+未指定的服务不受影响，没有记录的服务返回空实例数组。请求先完成全部参数与
+数据校验再判定失联并删除，任何校验错误都不创建、不更新、不删除实例；
+`evaluate_at` 早于任一指定服务内任一实例的 `heartbeat_at` 时返回
+HTTP 400 `invalid_parameter` 且不删除记录。存储读取或删除失败返回
+HTTP 503 `storage_unavailable`，跨服务删除在单个事务中原子完成，
+不会留下部分删除结果。
+
+成功返回 HTTP 200：`services` 严格按 `service_names` 的原顺序排列，
+另含规范化的 `evaluate_at` 和以 JSON 秒数表示的 `heartbeat_timeout`；
+每项含 `service_name` 与 `instances`，实例字段与单服务发现一致，
+按权重降序、权重相同按 `instance_id` 升序排列：
+
+```json
+{
+  "services": [
+    {"service_name":"billing","instances":[
+      {"service_name":"billing","instance_id":"i-1","address":"10.0.0.8:8080","port":8080,"healthy":true,"weight":10,"heartbeat_at":"2026-10-01T12:09:00Z"}
+    ]},
+    {"service_name":"gateway","instances":[]}
+  ],
+  "evaluate_at": "2026-10-01T12:10:00Z",
+  "heartbeat_timeout": 300
+}
+```
+
 ### 失联实例清理
 
 - `POST /api/v1/cleanup`
