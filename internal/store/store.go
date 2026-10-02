@@ -54,6 +54,13 @@ type WeightTarget struct {
 	Weight     float64
 }
 
+// HealthTarget carries one health-state change in a batch: the existing
+// instance identified by InstanceID gets only its Healthy flag replaced.
+type HealthTarget struct {
+	InstanceID string
+	Healthy    bool
+}
+
 // Open prepares the database file and the schema this service needs.
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
@@ -390,6 +397,73 @@ WHERE service_name = ? AND instance_id = ?`)
 
 	for _, target := range targets {
 		if _, err := updateStatement.Exec(target.Weight, serviceName, target.InstanceID); err != nil {
+			return nil, err
+		}
+	}
+
+	updated := make([]Instance, 0, len(targets))
+	for _, target := range targets {
+		row := tx.QueryRow(`
+SELECT service_name, instance_id, address, port, healthy, weight, heartbeat_at
+FROM service_instances
+WHERE service_name = ? AND instance_id = ?`, serviceName, target.InstanceID)
+		instance, err := scanInstance(row)
+		if err == sql.ErrNoRows {
+			return nil, ErrInstanceNotFound
+		}
+		if err != nil {
+			return nil, err
+		}
+		updated = append(updated, instance)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
+// UpdateHealth replaces only the healthy flag of the named service's
+// instances. All targets must exist before any row is touched: the existence
+// check runs inside the transaction and a missing target rolls the whole
+// batch back with ErrInstanceNotFound. Address, port, weight, heartbeat_at,
+// service name and instance id all keep their current values. Updated
+// records are returned in request order.
+func (s *Store) UpdateHealth(serviceName string, targets []HealthTarget) ([]Instance, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	countStatement, err := tx.Prepare(`
+SELECT COUNT(1) FROM service_instances
+WHERE service_name = ? AND instance_id = ?`)
+	if err != nil {
+		return nil, err
+	}
+	defer countStatement.Close()
+
+	for _, target := range targets {
+		var count int
+		if err := countStatement.QueryRow(serviceName, target.InstanceID).Scan(&count); err != nil {
+			return nil, err
+		}
+		if count == 0 {
+			return nil, ErrInstanceNotFound
+		}
+	}
+
+	updateStatement, err := tx.Prepare(`
+UPDATE service_instances SET healthy = ?
+WHERE service_name = ? AND instance_id = ?`)
+	if err != nil {
+		return nil, err
+	}
+	defer updateStatement.Close()
+
+	for _, target := range targets {
+		if _, err := updateStatement.Exec(target.Healthy, serviceName, target.InstanceID); err != nil {
 			return nil, err
 		}
 	}

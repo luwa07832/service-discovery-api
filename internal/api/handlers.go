@@ -519,6 +519,111 @@ func mapTargetError(err error) *apiError {
 	}
 }
 
+// handleUpdateHealth changes only the healthy flag of one path-addressed
+// instance. It reads healthy from the JSON body or the query parameter (the
+// JSON body wins when both carry it) and never resubmits address, port,
+// weight or heartbeat time: every other field keeps its current value. No
+// record is created when the target does not exist.
+func (s *Server) handleUpdateHealth(c *gin.Context) {
+	serviceName := strings.TrimSpace(c.Param("serviceName"))
+	if serviceName == "" {
+		writeError(c, errInvalidParameter("service_name must not be empty"))
+		return
+	}
+	instanceID := strings.TrimSpace(c.Param("instanceId"))
+	if instanceID == "" {
+		writeError(c, errInvalidParameter("instance_id must not be empty"))
+		return
+	}
+	healthy, apiErr := readHealthyInput(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	updated, err := s.store.UpdateHealth(serviceName, []store.HealthTarget{
+		{InstanceID: instanceID, Healthy: healthy},
+	})
+	if apiErr := mapTargetError(err); apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	c.JSON(200, gin.H{"instance": instanceJSON(updated[0])})
+}
+
+// handleBatchUpdateHealth changes only the healthy flags of several
+// instances of one path-addressed service. The body is one JSON object with
+// a non-empty updates list; every entry is validated and every target
+// confirmed to exist before any write, so an invalid or incomplete batch
+// changes no record and the store applies the whole batch atomically.
+func (s *Server) handleBatchUpdateHealth(c *gin.Context) {
+	serviceName := strings.TrimSpace(c.Param("serviceName"))
+	if serviceName == "" {
+		writeError(c, errInvalidParameter("service_name must not be empty"))
+		return
+	}
+
+	body, apiErr := readJSONObject(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	rawEntries, ok := body["updates"]
+	if !ok {
+		writeError(c, errInvalidParameter("updates must be a non-empty list"))
+		return
+	}
+	entries, ok := rawEntries.([]any)
+	if !ok || len(entries) == 0 {
+		writeError(c, errInvalidParameter("updates must be a non-empty list"))
+		return
+	}
+
+	targets := make([]store.HealthTarget, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, rawEntry := range entries {
+		entry, ok := rawEntry.(map[string]any)
+		if !ok {
+			writeError(c, errInvalidParameter("each instance must be an object"))
+			return
+		}
+		instanceID := strings.TrimSpace(stringValue(entry["instance_id"]))
+		if instanceID == "" {
+			writeError(c, errInvalidParameter("instance_id must not be empty"))
+			return
+		}
+		if _, duplicated := seen[instanceID]; duplicated {
+			writeError(c, errInvalidParameter("instance_id must not be duplicated"))
+			return
+		}
+		healthValue, present := entry["healthy"]
+		if !present {
+			writeError(c, errInvalidParameter("healthy must be a boolean true or false"))
+			return
+		}
+		healthy, ok := strictBoolValue(healthValue)
+		if !ok {
+			writeError(c, errInvalidParameter("healthy must be a boolean true or false"))
+			return
+		}
+		seen[instanceID] = struct{}{}
+		targets = append(targets, store.HealthTarget{
+			InstanceID: instanceID,
+			Healthy:    healthy,
+		})
+	}
+
+	updated, err := s.store.UpdateHealth(serviceName, targets)
+	if apiErr := mapTargetError(err); apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	instances := make([]gin.H, 0, len(updated))
+	for _, instance := range updated {
+		instances = append(instances, instanceJSON(instance))
+	}
+	c.JSON(200, gin.H{"updated": len(instances), "instances": instances})
+}
+
 func (s *Server) loadInstance(c *gin.Context) (store.Instance, *apiError) {
 	bag, apiErr := buildParamBag(c)
 	if apiErr != nil {

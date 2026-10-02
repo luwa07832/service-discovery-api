@@ -235,6 +235,68 @@ HTTP 404 `instance_not_found`，批量整批不生效；存储失败返回 HTTP 
 （`GET .../instances/{instanceId}/weight`）与发现结果继续按权重降序、
 实例标识升序排列。
 
+### 只修改实例健康状态
+
+- 单实例：`PUT /api/v1/services/{serviceName}/instances/{instanceId}/health`
+- 批量：`PUT /api/v1/services/{serviceName}/instances/health`
+
+调用方只需要提交新的健康状态，不必重复提交地址、端口、权重和心跳时间；
+这些字段逐字段保持当前值不变，服务名与实例标识也不变。入口不会创建不
+存在的实例，不会续期心跳，也不会触发发现入口中的失联删除；注册入口的
+整条覆盖语义同样保持不变。
+
+单实例从路径读取服务名与实例标识，`healthy` 从 JSON 请求体或查询参数
+读取，两者同时给出时以 JSON 字段为准。JSON 中 `healthy` 只接受布尔
+`true` 或 `false`；查询参数只接受小写文本 `true` 或 `false`。请求体示例
+（等价于
+`PUT /api/v1/services/billing/instances/i-1/health?healthy=false`，二者
+同时出现时以请求体为准）：
+
+```json
+{"healthy": false}
+```
+
+成功返回 HTTP 200，顶层 `instance` 为修改后的完整记录：
+
+```json
+{"instance":{"service_name":"billing","instance_id":"i-1","address":"10.0.0.8:8080","port":8080,"healthy":false,"weight":20,"heartbeat_at":"2026-10-01T12:00:00Z"}}
+```
+
+批量请求体必须是单个 JSON 对象，且只接受其中的 `updates` 非空数组；每
+项为对象并包含 `instance_id` 与布尔 `healthy`，`instance_id` 去掉首尾空
+白后不得为空，同批不得重复：
+
+```json
+{
+  "updates": [
+    {"instance_id": "i-2", "healthy": true},
+    {"instance_id": "i-1", "healthy": false}
+  ]
+}
+```
+
+请求先完整校验并确认所有目标存在，全部成立后才在一个事务里统一替换
+`healthy`。成功返回 HTTP 200，`updated` 为修改条数，`instances` 严格按
+请求顺序包含修改后的完整记录：
+
+```json
+{
+  "updated": 2,
+  "instances": [
+    {"service_name":"billing","instance_id":"i-2","address":"10.0.0.9:8080","port":8080,"healthy":true,"weight":9.5,"heartbeat_at":"2025-10-01T12:05:00Z"},
+    {"service_name":"billing","instance_id":"i-1","address":"10.0.0.8:8080","port":8080,"healthy":false,"weight":20,"heartbeat_at":"2026-10-01T12:00:00Z"}
+  ]
+}
+```
+
+服务名或实例标识为空、`healthy` 缺失或表示不合规（JSON 非布尔、查询参
+数不是小写 `true`/`false`），以及批量的 `updates` 缺失、为空、不是数
+组、条目不是对象、缺少 `instance_id`、`instance_id` 为空白或同批重复，
+均返回 HTTP 400 `invalid_parameter` 且不修改任何记录。目标实例不存在时
+（单实例或批量中的任一条目）返回 HTTP 404 `instance_not_found`，批量整
+批不生效；存储读写失败返回 HTTP 503 `storage_unavailable`，事务失败不
+留下部分更新。
+
 ### 按服务名发现健康实例
 
 - `GET|POST /api/v1/services/{serviceName}/discover`

@@ -124,6 +124,47 @@ func stringValue(value any) string {
 	return ""
 }
 
+// readHealthyInput accepts a new healthy state for one instance from either a
+// JSON body field ("healthy": true|false) or the ?healthy=true|false query
+// parameter. The JSON field wins when both carry it. JSON accepts only
+// booleans, while the query parameter accepts only the lowercase text "true"
+// or "false"; every other representation is a parameter error.
+func readHealthyInput(c *gin.Context) (bool, *apiError) {
+	queryValue, queryPresent := c.GetQuery("healthy")
+
+	if c.Request.Body != nil {
+		raw, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			return false, errInvalidParameter("request body cannot be read")
+		}
+		if len(bytes.TrimSpace(raw)) > 0 {
+			var body map[string]any
+			if err := json.Unmarshal(raw, &body); err != nil || body == nil {
+				return false, errInvalidParameter("request body must be a JSON object")
+			}
+			if value, present := body["healthy"]; present {
+				healthy, ok := strictBoolValue(value)
+				if !ok {
+					return false, errInvalidParameter("healthy must be a boolean true or false")
+				}
+				return healthy, nil
+			}
+		}
+	}
+
+	if !queryPresent {
+		return false, errInvalidParameter("healthy must be a boolean true or false")
+	}
+	switch queryValue {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, errInvalidParameter("healthy must be a boolean true or false")
+	}
+}
+
 // requiredText returns the trimmed text for the first matching key, or an error
 // when the value is missing or blank.
 func (b *paramBag) requiredText(keys []string, message string) (string, *apiError) {

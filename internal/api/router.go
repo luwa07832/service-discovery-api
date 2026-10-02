@@ -17,6 +17,9 @@ var emptyServicePaths = []*regexp.Regexp{
 	regexp.MustCompile(`^/api/v1/services/(/instances/[^/]+/heartbeat)/?$`),
 	regexp.MustCompile(`^/api/v1/services/(/instances/weight)/?$`),
 	regexp.MustCompile(`^/api/v1/services/(/instances/[^/]+/weight)/?$`),
+	regexp.MustCompile(`^/api/v1/services/(/instances/health)/?$`),
+	regexp.MustCompile(`^/api/v1/services/(/instances/[^/]+/health)/?$`),
+	regexp.MustCompile(`^/api/v1/services/[^/]+/instances/(/health)/?$`),
 	regexp.MustCompile(`^/api/v1/services/[^/]+/instances/(/weight)/?$`),
 }
 
@@ -87,6 +90,12 @@ func NewRouter(st *store.Store) *gin.Engine {
 	router.PUT("/api/v1/services/:serviceName/instances/weight", server.handleBatchUpdateWeight)
 	router.PUT("/api/v1/services/:serviceName/instances/:instanceId/weight", server.handleUpdateWeight)
 
+	// Health-state-only updates replace just the healthy flag; address,
+	// port, weight and heartbeat time keep their current values, no missing
+	// instance is created and no heartbeat is renewed.
+	router.PUT("/api/v1/services/:serviceName/instances/health", server.handleBatchUpdateHealth)
+	router.PUT("/api/v1/services/:serviceName/instances/:instanceId/health", server.handleUpdateHealth)
+
 	// Discovery of healthy instances with heartbeat-lost removal.
 	router.GET("/api/v1/services/:serviceName/discover", server.handleDiscover)
 	router.GET("/api/v1/discover", server.handleDiscover)
@@ -115,6 +124,20 @@ func NewRouter(st *store.Store) *gin.Engine {
 				case c.Request.Method == http.MethodPut && strings.HasSuffix(c.Request.URL.Path, "/instances/weight"):
 					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
 					server.handleBatchUpdateWeight(c)
+				case c.Request.Method == http.MethodPut && strings.HasSuffix(c.Request.URL.Path, "/instances/health"):
+					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
+					server.handleBatchUpdateHealth(c)
+				case c.Request.Method == http.MethodPut && strings.HasSuffix(c.Request.URL.Path, "/health"):
+					emptyInstance := strings.HasSuffix(c.Request.URL.Path, "//health")
+					if emptyInstance {
+						c.Params = gin.Params{
+							{Key: "serviceName", Value: ""},
+							{Key: "instanceId", Value: ""},
+						}
+					} else {
+						c.Params = gin.Params{{Key: "serviceName", Value: ""}}
+					}
+					server.handleUpdateHealth(c)
 				case c.Request.Method == http.MethodPut && strings.HasSuffix(c.Request.URL.Path, "/weight"):
 					emptyInstance := strings.HasSuffix(c.Request.URL.Path, "//weight")
 					if emptyInstance {
