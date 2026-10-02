@@ -65,6 +65,49 @@ go run .
 - `weight`：权重，必填且必须大于 0（JSON 数字或数字字符串），小于等于 0 返回 `invalid_parameter` 且原记录不变。
 - `heartbeat_at`：心跳时间，必填，接受 RFC3339 时间或 Unix 秒。
 
+### 批量注册 / 覆盖实例
+
+- `POST /api/v1/services/{serviceName}/instances/batch`（服务名取路径值，即使请求体提供 `service_name` 也以路径为准）
+- `POST /api/v1/register/batch`（服务名取请求体的 `service_name`）
+
+一次请求登记或覆盖同一服务下多个实例，请求体为单个 JSON 对象并含非空 `instances`
+数组；数组每项沿用单实例注册的字段语义：`instance_id` 必填非空且同批不得重复，
+`address` 缺省空字符串，`port` 缺省 `0` 且仅接受非负整数，`healthy` 缺省 `false`
+且仅接受布尔 `true`/`false`，`weight` 必填且大于 0（JSON 数字或数字字符串），
+`heartbeat_at` 必填，接受 RFC3339 时间或 Unix 秒。
+
+```json
+{
+  "service_name": "billing",
+  "instances": [
+    {"instance_id": "i-1", "address": "10.0.0.8:8080", "port": 8080, "healthy": true, "weight": 10, "heartbeat_at": "2026-10-01T12:00:00Z"},
+    {"instance_id": "i-2", "weight": "5", "heartbeat_at": 1759320300}
+  ]
+}
+```
+
+有效请求按数组顺序登记或覆盖相同 `(service_name, instance_id)` 的记录，成功返回
+HTTP 200：`service_name` 为所属服务名，`registered` 为成功处理条目数，
+`instances` 为写入的完整记录并严格按请求顺序返回：
+
+```json
+{
+  "service_name": "billing",
+  "registered": 2,
+  "instances": [
+    {"service_name":"billing","instance_id":"i-1","address":"10.0.0.8:8080","port":8080,"healthy":true,"weight":10,"heartbeat_at":"2026-10-01T12:00:00Z"},
+    {"service_name":"billing","instance_id":"i-2","address":"","port":0,"healthy":false,"weight":5,"heartbeat_at":"2025-10-01T12:05:00Z"}
+  ]
+}
+```
+
+写入前校验全部条目：请求体不是单个 JSON 对象、`instances` 缺失或为空、
+任一条目缺少或重复 `instance_id`，或 `port`、`healthy`、`weight`、
+`heartbeat_at` 不合规，均返回 HTTP 400 `invalid_parameter` 单个顶层 `error`
+对象，且不创建、不更新任何实例。整批存储失败返回 HTTP 503
+`storage_unavailable`，整批回滚、不留下部分更新。批量注册不触发失联清理，
+也不改变请求之外的任何实例记录。
+
 ### 公开查询
 
 - 实例完整记录：`GET /api/v1/services/{serviceName}/instances/{instanceId}`

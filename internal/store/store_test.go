@@ -153,6 +153,36 @@ VALUES ('svc', 'i', '10.0.0.1', 1, 3, '2026-10-01T12:00:00Z');`); err != nil {
 	}
 }
 
+func TestUpsertInstancesInsertsOverwritesAndKeepsOrder(t *testing.T) {
+	st := openTestStore(t)
+	heartbeat := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+
+	if _, err := st.UpsertInstance(InstanceInput{
+		ServiceName: "svc", InstanceID: "i-1", Address: "10.0.0.1:8080",
+		Port: 8080, Healthy: true, Weight: 7, HeartbeatAt: heartbeat,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	inputs := []InstanceInput{
+		{ServiceName: "svc", InstanceID: "i-2", Address: "10.0.0.2", Weight: 5, HeartbeatAt: heartbeat.Add(time.Minute)},
+		{ServiceName: "svc", InstanceID: "i-1", Address: "10.0.0.3", Port: 9090, Healthy: false, Weight: 1, HeartbeatAt: heartbeat.Add(2 * time.Minute)},
+	}
+	saved, err := st.UpsertInstances(inputs)
+	if err != nil {
+		t.Fatalf("upsert batch: %v", err)
+	}
+	if len(saved) != 2 || saved[0].InstanceID != "i-2" || saved[1].InstanceID != "i-1" {
+		t.Fatalf("saved order = %+v", saved)
+	}
+	overwritten, found, _ := st.GetInstance("svc", "i-1")
+	if !found || overwritten.Address != "10.0.0.3" || overwritten.Port != 9090 ||
+		overwritten.Healthy || overwritten.Weight != 1 ||
+		!overwritten.HeartbeatAt.Equal(heartbeat.Add(2*time.Minute)) {
+		t.Fatalf("i-1 not overwritten: %+v", overwritten)
+	}
+}
+
 func TestTouchHeartbeatsUpdatesOnlyHeartbeatInRequestOrder(t *testing.T) {
 	st := openTestStore(t)
 	heartbeat := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)

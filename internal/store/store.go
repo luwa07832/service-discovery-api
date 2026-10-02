@@ -118,6 +118,61 @@ ON CONFLICT(service_name, instance_id) DO UPDATE SET
 	}, nil
 }
 
+// UpsertInstances inserts or overwrites several instances of one service in a
+// single transaction. Every input shares the same service name and instance
+// ids are expected to be unique within the batch; stored records are returned
+// in request order. Any failure rolls the whole batch back without leaving
+// partial updates.
+func (s *Store) UpsertInstances(inputs []InstanceInput) ([]Instance, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	statement, err := tx.Prepare(`
+INSERT INTO service_instances
+	(service_name, instance_id, address, port, healthy, weight, heartbeat_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(service_name, instance_id) DO UPDATE SET
+	address = excluded.address,
+	port = excluded.port,
+	healthy = excluded.healthy,
+	weight = excluded.weight,
+	heartbeat_at = excluded.heartbeat_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer statement.Close()
+
+	for _, input := range inputs {
+		if _, err := statement.Exec(
+			input.ServiceName, input.InstanceID, input.Address, input.Port,
+			input.Healthy, input.Weight,
+			input.HeartbeatAt.UTC().Format(time.RFC3339Nano)); err != nil {
+			return nil, err
+		}
+	}
+
+	instances := make([]Instance, 0, len(inputs))
+	for _, input := range inputs {
+		instances = append(instances, Instance{
+			ServiceName: input.ServiceName,
+			InstanceID:  input.InstanceID,
+			Address:     input.Address,
+			Port:        input.Port,
+			Healthy:     input.Healthy,
+			Weight:      input.Weight,
+			HeartbeatAt: input.HeartbeatAt.UTC(),
+		})
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return instances, nil
+}
+
 // GetInstance reads the current record of one instance.
 func (s *Store) GetInstance(serviceName, instanceID string) (Instance, bool, error) {
 	row := s.db.QueryRow(`
