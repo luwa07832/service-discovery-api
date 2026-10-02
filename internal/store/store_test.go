@@ -104,6 +104,41 @@ func TestUpsertGetOverwriteAndList(t *testing.T) {
 	}
 }
 
+func TestListAllInstancesGroupsByServiceInNameOrder(t *testing.T) {
+	st := openTestStore(t)
+	heartbeat := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+
+	inputs := []InstanceInput{
+		{ServiceName: "zeta", InstanceID: "i-2", Weight: 1, HeartbeatAt: heartbeat},
+		{ServiceName: "zeta", InstanceID: "i-1", Weight: 1, HeartbeatAt: heartbeat},
+		{ServiceName: "alpha", InstanceID: "i-1", Weight: 1, HeartbeatAt: heartbeat},
+	}
+	for _, input := range inputs {
+		if _, err := st.UpsertInstance(input); err != nil {
+			t.Fatalf("upsert %s/%s: %v", input.ServiceName, input.InstanceID, err)
+		}
+	}
+
+	all, err := st.ListAllInstances()
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("len = %d, want 3", len(all))
+	}
+	got := [][2]string{
+		{all[0].ServiceName, all[0].InstanceID},
+		{all[1].ServiceName, all[1].InstanceID},
+		{all[2].ServiceName, all[2].InstanceID},
+	}
+	want := [][2]string{{"alpha", "i-1"}, {"zeta", "i-1"}, {"zeta", "i-2"}}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("order = %v, want %v", got, want)
+		}
+	}
+}
+
 func TestOpenMigratesDatabaseWithoutPortColumn(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "old.db")
 	raw, err := sql.Open("sqlite", path)

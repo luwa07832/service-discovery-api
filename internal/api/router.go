@@ -31,6 +31,10 @@ func NewRouter(st *store.Store) *gin.Engine {
 
 	server := &Server{store: st}
 
+	// Read-only service overview: aggregates every stored instance by
+	// service without creating, updating, deleting or running lost cleanup.
+	router.GET("/api/v1/services", server.handleServiceOverview)
+
 	router.GET("/healthz", func(c *gin.Context) {
 		if err := st.Ping(); err != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"code": "storage_unavailable", "message": "database is not available"}})

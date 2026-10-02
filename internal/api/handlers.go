@@ -628,3 +628,86 @@ func sortInstances(instances []gin.H) {
 		return stringValue(left["instance_id"]) < stringValue(right["instance_id"])
 	})
 }
+
+// handleServiceOverview serves GET /api/v1/services with a read-only
+// snapshot grouping every stored instance by service. No record is created,
+// updated or deleted, and discovery-style lost cleanup is never triggered.
+func (s *Server) handleServiceOverview(c *gin.Context) {
+	bag, apiErr := buildParamBag(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	evaluateValue, ok := bag.get(evaluateAtKeys)
+	if !ok {
+		writeError(c, errInvalidParameter("evaluate_at is required"))
+		return
+	}
+	evaluateAt, ok := parseTimeValue(evaluateValue)
+	if !ok {
+		writeError(c, errInvalidParameter("evaluate_at must be a valid timestamp"))
+		return
+	}
+	timeoutValue, ok := bag.get(timeoutKeys)
+	if !ok {
+		writeError(c, errInvalidParameter("heartbeat_timeout must be greater than zero"))
+		return
+	}
+	timeout, ok := parseTimeout(timeoutValue)
+	if !ok || timeout <= 0 {
+		writeError(c, errInvalidParameter("heartbeat_timeout must be greater than zero"))
+		return
+	}
+
+	instances, err := s.store.ListAllInstances()
+	if err != nil {
+		writeError(c, errStorageUnavailable())
+		return
+	}
+	for _, instance := range instances {
+		if evaluateAt.Before(instance.HeartbeatAt) {
+			writeError(c, errInvalidParameter("evaluate_at must not be earlier than heartbeat_at"))
+			return
+		}
+	}
+
+	type serviceCounters struct {
+		total     int64
+		available int64
+		unhealthy int64
+		lost      int64
+	}
+	counters := make(map[string]*serviceCounters)
+	names := make([]string, 0)
+	for _, instance := range instances {
+		counts, exists := counters[instance.ServiceName]
+		if !exists {
+			counts = &serviceCounters{}
+			counters[instance.ServiceName] = counts
+			names = append(names, instance.ServiceName)
+		}
+		counts.total++
+		switch {
+		case evaluateAt.After(instance.HeartbeatAt.Add(timeout)):
+			counts.lost++
+		case instance.Healthy:
+			counts.available++
+		default:
+			counts.unhealthy++
+		}
+	}
+	sort.Strings(names)
+
+	services := make([]gin.H, 0, len(names))
+	for _, name := range names {
+		counts := counters[name]
+		services = append(services, gin.H{
+			"service_name":              name,
+			"total_instances":           counts.total,
+			"available_instances":       counts.available,
+			"unhealthy_fresh_instances": counts.unhealthy,
+			"lost_instances":            counts.lost,
+		})
+	}
+	c.JSON(200, gin.H{"services": services})
+}

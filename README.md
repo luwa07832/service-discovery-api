@@ -195,6 +195,31 @@ HTTP 200：`service_name` 为所属服务名，`registered` 为成功处理条�
 排序规则固定为：权重由高到低；权重相同则按实例标识升序，
 保证同一输入输出顺序确定。
 
+### 服务总览（只读）
+
+- `GET /api/v1/services`
+
+参数：`evaluate_at`（评估时刻，必填，接受 RFC3339 时间或 Unix 秒）、
+`heartbeat_timeout`（心跳超时时长，必填且大于零，接受正数秒或 `30s`/`2m` 时长文本）。
+
+返回 `services` 数组，包含所有仍有实例记录的服务，并按 `service_name` 升序排列；
+没有任何实例记录时返回空数组 `[]`。每项字段：
+
+- `service_name`：服务名；
+- `total_instances`：该服务当前实例记录总数；
+- `available_instances`：`healthy` 为 `true` 且未失联的实例数；
+- `unhealthy_fresh_instances`：`healthy` 为 `false` 但未失联的实例数；
+- `lost_instances`：严格失联的实例数，失联判定沿用
+  `evaluate_at` 晚于 `heartbeat_at + heartbeat_timeout` 的规则，等于边界不算失联。
+
+`total_instances` 始终等于后三项之和；同一组输入的计数与顺序确定。该入口只读取和
+汇总 SQLite 记录，不创建、不更新、不删除任何实例，也不触发发现请求的失联清理；
+失联实例仍保留在存储中并计入 `lost_instances`。
+
+`evaluate_at` 缺失或无效、`heartbeat_timeout` 缺失或不大于零，以及 `evaluate_at`
+早于任一实例 `heartbeat_at` 时，返回 HTTP 400 `invalid_parameter` 单个 `error`
+对象，且不改变任何记录；存储不可用时返回 HTTP 503 `storage_unavailable`。
+
 ## 参数错误
 
 `service_name` 为空、`instance_id` 为空、`weight` 缺失或不大于 0、
