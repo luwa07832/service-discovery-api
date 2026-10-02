@@ -248,3 +248,40 @@ func TestTouchHeartbeatsMissingInstanceRollsBack(t *testing.T) {
 		t.Fatalf("batch was not rolled back: %+v", got)
 	}
 }
+
+func TestListAllInstancesReturnsAllServicesOrdered(t *testing.T) {
+	st := openTestStore(t)
+	heartbeat := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	inputs := []InstanceInput{
+		{ServiceName: "zeta", InstanceID: "i-2", Weight: 1, HeartbeatAt: heartbeat},
+		{ServiceName: "alpha", InstanceID: "i-2", Weight: 1, HeartbeatAt: heartbeat},
+		{ServiceName: "alpha", InstanceID: "i-1", Weight: 1, HeartbeatAt: heartbeat},
+	}
+	for _, input := range inputs {
+		if _, err := st.UpsertInstance(input); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+	}
+
+	all, err := st.ListAllInstances()
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("len = %d, want 3", len(all))
+	}
+	got := [3][2]string{
+		{all[0].ServiceName, all[0].InstanceID},
+		{all[1].ServiceName, all[1].InstanceID},
+		{all[2].ServiceName, all[2].InstanceID},
+	}
+	want := [3][2]string{{"alpha", "i-1"}, {"alpha", "i-2"}, {"zeta", "i-2"}}
+	if got != want {
+		t.Fatalf("order = %v, want %v", got, want)
+	}
+
+	// The read does not modify anything.
+	if count := len(all); count != 3 {
+		t.Fatalf("unexpected record count %d", count)
+	}
+}

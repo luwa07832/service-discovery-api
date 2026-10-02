@@ -54,6 +54,8 @@ func NewRouter(st *store.Store) *gin.Engine {
 	router.POST("/api/v1/register/batch", server.handleBatchUpsertByBody)
 
 	// Public instance query entries.
+	// Read-only overview of every service that still has instance records.
+	router.GET("/api/v1/services", server.handleListServices)
 	router.GET("/api/v1/services/:serviceName/instances", server.handleListInstances)
 	router.GET("/api/v1/services/:serviceName/instances/:instanceId", server.handleGetInstance)
 	router.GET("/api/v1/services/:serviceName/instances/:instanceId/health", server.handleGetHealth)

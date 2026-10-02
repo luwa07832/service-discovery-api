@@ -195,6 +195,42 @@ HTTP 200：`service_name` 为所属服务名，`registered` 为成功处理条�
 排序规则固定为：权重由高到低；权重相同则按实例标识升序，
 保证同一输入输出顺序确定。
 
+### 服务总览（只读）
+
+- `GET /api/v1/services`
+
+用 `evaluate_at`（必填，接受 RFC3339 时间或 Unix 秒）与
+`heartbeat_timeout`（必填且大于零，接受正数秒数或 `30s`、`2m` 时长文本）
+生成全部服务的只读快照。失联判定与发现入口一致：仅当 `evaluate_at` 晚于
+`heartbeat_at + heartbeat_timeout` 时判定失联，等于边界不算失联。
+
+返回 `services` 数组，只包含仍有实例记录的服务，并按 `service_name`
+升序排列；没有任何记录时为空数组。每项字段：
+
+- `service_name`：服务名。
+- `total_instances`：当前记录总数。
+- `available_instances`：`healthy` 为 `true` 且未失联的实例数。
+- `unhealthy_fresh_instances`：`healthy` 为 `false` 但未失联的实例数。
+- `lost_instances`：严格失联的实例数。
+
+`total_instances` 恒等于后三项之和，输入相同时计数与顺序确定。示例：
+
+```json
+{
+  "services": [
+    {"service_name":"billing","total_instances":3,"available_instances":1,"unhealthy_fresh_instances":1,"lost_instances":1},
+    {"service_name":"gateway","total_instances":1,"available_instances":1,"unhealthy_fresh_instances":0,"lost_instances":0}
+  ]
+}
+```
+
+该入口只读取和汇总 SQLite 记录：不创建、不更新、不删除任何实例，
+失联实例只计入 `lost_instances` 而保留在存储中，也不触发发现请求的
+失联清理。`evaluate_at` 缺失或无效、`heartbeat_timeout` 缺失或不大于零，
+以及 `evaluate_at` 早于任一实例的 `heartbeat_at` 时，返回 HTTP 400
+`invalid_parameter` 且不改变记录；存储不可用时返回 HTTP 503
+`storage_unavailable`。
+
 ## 参数错误
 
 `service_name` 为空、`instance_id` 为空、`weight` 缺失或不大于 0、

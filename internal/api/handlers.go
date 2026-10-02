@@ -519,6 +519,98 @@ func (s *Server) handleListInstances(c *gin.Context) {
 	c.JSON(200, gin.H{"service_name": serviceName, "instances": results})
 }
 
+// handleListServices serves the read-only service overview. It aggregates the
+// current SQLite records of every service at the requested evaluation point
+// without creating, updating or deleting anything, and in particular without
+// running the discovery lost-record cleanup. Lost instances stay stored and
+// are only counted as lost.
+func (s *Server) handleListServices(c *gin.Context) {
+	bag, apiErr := buildParamBag(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	evaluateValue, ok := bag.get(evaluateAtKeys)
+	if !ok {
+		writeError(c, errInvalidParameter("evaluate_at is required"))
+		return
+	}
+	evaluateAt, ok := parseTimeValue(evaluateValue)
+	if !ok {
+		writeError(c, errInvalidParameter("evaluate_at must be a valid timestamp"))
+		return
+	}
+	timeoutValue, ok := bag.get(timeoutKeys)
+	if !ok {
+		writeError(c, errInvalidParameter("heartbeat_timeout must be greater than zero"))
+		return
+	}
+	timeout, ok := parseTimeout(timeoutValue)
+	if !ok || timeout <= 0 {
+		writeError(c, errInvalidParameter("heartbeat_timeout must be greater than zero"))
+		return
+	}
+
+	instances, err := s.store.ListAllInstances()
+	if err != nil {
+		writeError(c, errStorageUnavailable())
+		return
+	}
+	for _, instance := range instances {
+		if evaluateAt.Before(instance.HeartbeatAt) {
+			writeError(c, errInvalidParameter("evaluate_at must not be earlier than heartbeat_at"))
+			return
+		}
+	}
+
+	// Aggregate records per service. The same counters classify every
+	// record exactly once, so total_instances is always the sum of the
+	// three state counters.
+	byService := make(map[string]*serviceCounters)
+	for _, instance := range instances {
+		counters := byService[instance.ServiceName]
+		if counters == nil {
+			counters = &serviceCounters{}
+			byService[instance.ServiceName] = counters
+		}
+		counters.total++
+		switch {
+		case evaluateAt.After(instance.HeartbeatAt.Add(timeout)):
+			counters.lost++
+		case instance.Healthy:
+			counters.available++
+		default:
+			counters.unhealthyFresh++
+		}
+	}
+
+	serviceNames := make([]string, 0, len(byService))
+	for serviceName := range byService {
+		serviceNames = append(serviceNames, serviceName)
+	}
+	sort.Strings(serviceNames)
+
+	services := make([]gin.H, 0, len(serviceNames))
+	for _, serviceName := range serviceNames {
+		counters := byService[serviceName]
+		services = append(services, gin.H{
+			"service_name":              serviceName,
+			"total_instances":           counters.total,
+			"available_instances":       counters.available,
+			"unhealthy_fresh_instances": counters.unhealthyFresh,
+			"lost_instances":            counters.lost,
+		})
+	}
+	c.JSON(200, gin.H{"services": services})
+}
+
+type serviceCounters struct {
+	total          int
+	available      int
+	unhealthyFresh int
+	lost           int
+}
+
 // handleDiscover implements the weighted discovery entry: only explicitly
 // healthy instances whose last heartbeat is not strictly past the lost
 // boundary are returned. An instance exactly on the boundary is still

@@ -215,6 +215,34 @@ WHERE service_name = ?`, serviceName)
 	return instances, nil
 }
 
+// ListAllInstances reads every current record across all services. It never
+// creates, updates or deletes rows; callers aggregate the read-only snapshot
+// themselves. Results are ordered by service name and then instance id so
+// identical storage content yields identical output.
+func (s *Store) ListAllInstances() ([]Instance, error) {
+	rows, err := s.db.Query(`
+SELECT service_name, instance_id, address, port, healthy, weight, heartbeat_at
+FROM service_instances
+ORDER BY service_name ASC, instance_id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	instances := make([]Instance, 0)
+	for rows.Next() {
+		instance, err := scanInstance(rows)
+		if err != nil {
+			return nil, err
+		}
+		instances = append(instances, instance)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return instances, nil
+}
+
 // DeleteInstance removes one instance record and reports whether it existed.
 func (s *Store) DeleteInstance(serviceName, instanceID string) (bool, error) {
 	result, err := s.db.Exec(`
