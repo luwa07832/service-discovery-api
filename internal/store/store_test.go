@@ -218,3 +218,48 @@ func TestTouchHeartbeatsMissingInstanceRollsBack(t *testing.T) {
 		t.Fatalf("batch was not rolled back: %+v", got)
 	}
 }
+
+func TestUpsertInstancesWritesBatchInInputOrder(t *testing.T) {
+	st := openTestStore(t)
+	heartbeat := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	seed := InstanceInput{
+		ServiceName: "svc", Address: "10.0.0.1:8080", Port: 8080,
+		Healthy: true, Weight: 7, HeartbeatAt: heartbeat,
+	}
+	existing := seed
+	existing.InstanceID = "i-1"
+	if _, err := st.UpsertInstance(existing); err != nil {
+		t.Fatalf("upsert i-1: %v", err)
+	}
+	other := seed
+	other.ServiceName = "svc-other"
+	other.InstanceID = "i-2"
+	if _, err := st.UpsertInstance(other); err != nil {
+		t.Fatalf("upsert other: %v", err)
+	}
+
+	replacement := seed
+	replacement.InstanceID = "i-1"
+	replacement.Weight = 20
+	replacement.HeartbeatAt = heartbeat.Add(30 * time.Minute)
+	fresh := seed
+	fresh.InstanceID = "i-2"
+	fresh.Weight = 3
+	written, err := st.UpsertInstances([]InstanceInput{fresh, replacement})
+	if err != nil {
+		t.Fatalf("batch upsert: %v", err)
+	}
+	if len(written) != 2 || written[0].InstanceID != "i-2" || written[1].InstanceID != "i-1" {
+		t.Fatalf("written order = %+v", written)
+	}
+	overwritten, _, _ := st.GetInstance("svc", "i-1")
+	if overwritten.Weight != 20 || !overwritten.HeartbeatAt.Equal(heartbeat.Add(30*time.Minute)) {
+		t.Fatalf("i-1 not overwritten: %+v", overwritten)
+	}
+	if _, found, _ := st.GetInstance("svc", "i-2"); !found {
+		t.Fatalf("i-2 not inserted")
+	}
+	if peer, _, _ := st.GetInstance("svc-other", "i-2"); peer.Weight != 7 {
+		t.Fatalf("other service changed by batch: %+v", peer)
+	}
+}

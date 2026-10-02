@@ -122,6 +122,120 @@ func (s *Server) handleUpsert(c *gin.Context) {
 	c.JSON(200, gin.H{"instance": instanceJSON(instance)})
 }
 
+// handleBatchRegister registers or overwrites several instances of one
+// service in a single request. Every entry is validated before any write,
+// so a malformed request creates or updates nothing; the whole batch is
+// stored in one transaction, so a storage failure leaves no partial
+// updates. The path entry always uses the path service name, even when the
+// body carries its own service_name.
+func (s *Server) handleBatchRegister(c *gin.Context) {
+	bag, apiErr := buildParamBag(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	serviceName := strings.TrimSpace(c.Param("serviceName"))
+	if serviceName == "" {
+		serviceName, apiErr = bag.requiredText(serviceNameKeys, "service_name must not be empty")
+		if apiErr != nil {
+			writeError(c, apiErr)
+			return
+		}
+	}
+	rawEntries, ok := bag.get([]string{"instances"})
+	if !ok {
+		writeError(c, errInvalidParameter("instances must be a non-empty list"))
+		return
+	}
+	entries, ok := rawEntries.([]any)
+	if !ok || len(entries) == 0 {
+		writeError(c, errInvalidParameter("instances must be a non-empty list"))
+		return
+	}
+	inputs := make([]store.InstanceInput, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, rawEntry := range entries {
+		entry, ok := rawEntry.(map[string]any)
+		if !ok {
+			writeError(c, errInvalidParameter("each instance must be an object"))
+			return
+		}
+		instanceID := strings.TrimSpace(stringValue(entry["instance_id"]))
+		if instanceID == "" {
+			writeError(c, errInvalidParameter("instance_id must not be empty"))
+			return
+		}
+		if _, duplicated := seen[instanceID]; duplicated {
+			writeError(c, errInvalidParameter("instance_id must not be duplicated"))
+			return
+		}
+		seen[instanceID] = struct{}{}
+		weightValue, present := entry["weight"]
+		if !present {
+			writeError(c, errInvalidParameter("weight must be a positive number"))
+			return
+		}
+		weight, ok := positiveNumber(weightValue)
+		if !ok {
+			writeError(c, errInvalidParameter("weight must be a positive number"))
+			return
+		}
+		port := int64(0)
+		if portValue, present := entry["port"]; present {
+			port, ok = parsePortValue(portValue)
+			if !ok {
+				writeError(c, errInvalidParameter("port must be a non-negative integer"))
+				return
+			}
+		}
+		healthy := false
+		if healthValue, present := entry["healthy"]; present {
+			healthy, ok = strictBoolValue(healthValue)
+			if !ok {
+				writeError(c, errInvalidParameter("healthy must be a boolean true or false"))
+				return
+			}
+		}
+		heartbeatValue, present := entry["heartbeat_at"]
+		if !present {
+			writeError(c, errInvalidParameter("heartbeat_at is required"))
+			return
+		}
+		heartbeatAt, ok := parseTimeValue(heartbeatValue)
+		if !ok {
+			writeError(c, errInvalidParameter("heartbeat_at must be a valid timestamp"))
+			return
+		}
+		address := ""
+		if addressValue, present := entry["address"]; present {
+			address = stringValue(addressValue)
+		}
+		inputs = append(inputs, store.InstanceInput{
+			ServiceName: serviceName,
+			InstanceID:  instanceID,
+			Address:     address,
+			Port:        port,
+			Healthy:     healthy,
+			Weight:      weight,
+			HeartbeatAt: heartbeatAt,
+		})
+	}
+	instances, err := s.store.UpsertInstances(inputs)
+	if err != nil {
+		writeError(c, errStorageUnavailable())
+		return
+	}
+	results := make([]gin.H, 0, len(instances))
+	for _, instance := range instances {
+		results = append(results, instanceJSON(instance))
+	}
+	c.JSON(200, gin.H{
+		"service_name": serviceName,
+		"registered":   len(results),
+		"instances":    results,
+	})
+}
+
 func (s *Server) handleDelete(c *gin.Context) {
 	bag, apiErr := buildParamBag(c)
 	if apiErr != nil {

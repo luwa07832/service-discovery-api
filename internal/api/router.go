@@ -13,6 +13,7 @@ import (
 var emptyServicePaths = []*regexp.Regexp{
 	regexp.MustCompile(`^/api/v1/services/(/instances)?/?$`),
 	regexp.MustCompile(`^/api/v1/services/(/discover)/?$`),
+	regexp.MustCompile(`^/api/v1/services/(/instances/batch)/?$`),
 	regexp.MustCompile(`^/api/v1/services/(/instances/[^/]+/heartbeat)/?$`),
 }
 
@@ -45,6 +46,12 @@ func NewRouter(st *store.Store) *gin.Engine {
 	router.POST("/api/v1/register", server.handleUpsert)
 	router.POST("/api/v1/instances", server.handleUpsert)
 	router.PUT("/api/v1/instances", server.handleUpsert)
+
+	// Batch registration: one request registers or overwrites several
+	// instances of the same service. The path entry always uses the path
+	// service name; the other reads service_name from the request body.
+	router.POST("/api/v1/services/:serviceName/instances/batch", server.handleBatchRegister)
+	router.POST("/api/v1/register/batch", server.handleBatchRegister)
 
 	// Public instance query entries.
 	router.GET("/api/v1/services/:serviceName/instances", server.handleListInstances)
@@ -86,6 +93,8 @@ func NewRouter(st *store.Store) *gin.Engine {
 					server.handleDiscover(c)
 				case strings.HasSuffix(c.Request.URL.Path, "/heartbeat"):
 					server.handleHeartbeat(c)
+				case strings.HasSuffix(c.Request.URL.Path, "/batch"):
+					server.handleBatchRegister(c)
 				case c.Request.Method == http.MethodDelete || (c.Request.Method == http.MethodPost && strings.HasSuffix(c.Request.URL.Path, "/delete")):
 					server.handleDelete(c)
 				case c.Request.Method == http.MethodPost:

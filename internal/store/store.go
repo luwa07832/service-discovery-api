@@ -89,11 +89,7 @@ func (s *Store) Ping() error { return s.db.Ping() }
 // Close releases the database handle.
 func (s *Store) Close() error { return s.db.Close() }
 
-// UpsertInstance inserts an instance record or overwrites the current record
-// of the same (service name, instance id) pair.
-func (s *Store) UpsertInstance(input InstanceInput) (Instance, error) {
-	heartbeat := input.HeartbeatAt.UTC().Format(time.RFC3339Nano)
-	_, err := s.db.Exec(`
+const upsertInstanceSQL = `
 INSERT INTO service_instances
 	(service_name, instance_id, address, port, healthy, weight, heartbeat_at)
 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -102,7 +98,13 @@ ON CONFLICT(service_name, instance_id) DO UPDATE SET
 	port = excluded.port,
 	healthy = excluded.healthy,
 	weight = excluded.weight,
-	heartbeat_at = excluded.heartbeat_at`,
+	heartbeat_at = excluded.heartbeat_at`
+
+// UpsertInstance inserts an instance record or overwrites the current record
+// of the same (service name, instance id) pair.
+func (s *Store) UpsertInstance(input InstanceInput) (Instance, error) {
+	heartbeat := input.HeartbeatAt.UTC().Format(time.RFC3339Nano)
+	_, err := s.db.Exec(upsertInstanceSQL,
 		input.ServiceName, input.InstanceID, input.Address, input.Port, input.Healthy, input.Weight, heartbeat)
 	if err != nil {
 		return Instance{}, err
@@ -116,6 +118,50 @@ ON CONFLICT(service_name, instance_id) DO UPDATE SET
 		Weight:      input.Weight,
 		HeartbeatAt: input.HeartbeatAt.UTC(),
 	}, nil
+}
+
+// UpsertInstances inserts or overwrites several instance records of one
+// service. The whole batch runs in one transaction: any failure rolls the
+// transaction back, so a failed batch leaves no partial updates behind.
+// Written records are returned in input order.
+func (s *Store) UpsertInstances(inputs []InstanceInput) ([]Instance, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	statement, err := tx.Prepare(upsertInstanceSQL)
+	if err != nil {
+		return nil, err
+	}
+	defer statement.Close()
+
+	for _, input := range inputs {
+		heartbeat := input.HeartbeatAt.UTC().Format(time.RFC3339Nano)
+		if _, err := statement.Exec(
+			input.ServiceName, input.InstanceID, input.Address, input.Port,
+			input.Healthy, input.Weight, heartbeat); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	instances := make([]Instance, 0, len(inputs))
+	for _, input := range inputs {
+		instances = append(instances, Instance{
+			ServiceName: input.ServiceName,
+			InstanceID:  input.InstanceID,
+			Address:     input.Address,
+			Port:        input.Port,
+			Healthy:     input.Healthy,
+			Weight:      input.Weight,
+			HeartbeatAt: input.HeartbeatAt.UTC(),
+		})
+	}
+	return instances, nil
 }
 
 // GetInstance reads the current record of one instance.
