@@ -47,6 +47,12 @@ type HeartbeatTarget struct {
 	HeartbeatAt time.Time
 }
 
+// InstanceKey identifies one instance record by its primary key.
+type InstanceKey struct {
+	ServiceName string
+	InstanceID  string
+}
+
 // Open prepares the database file and the schema this service needs.
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
@@ -255,6 +261,44 @@ DELETE FROM service_instances WHERE service_name = ? AND instance_id = ?`, servi
 		return false, err
 	}
 	return affected > 0, nil
+}
+
+// DeleteInstances removes the identified records in a single transaction and
+// returns each record exactly as it was right before deletion. Keys whose
+// record no longer exists are skipped. Any storage failure rolls the whole
+// transaction back, so a failed cleanup never leaves partial deletions.
+func (s *Store) DeleteInstances(keys []InstanceKey) ([]Instance, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	removed := make([]Instance, 0, len(keys))
+	for _, key := range keys {
+		row := tx.QueryRow(`
+SELECT service_name, instance_id, address, port, healthy, weight, heartbeat_at
+FROM service_instances
+WHERE service_name = ? AND instance_id = ?`, key.ServiceName, key.InstanceID)
+		instance, err := scanInstance(row)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(`
+DELETE FROM service_instances WHERE service_name = ? AND instance_id = ?`,
+			key.ServiceName, key.InstanceID); err != nil {
+			return nil, err
+		}
+		removed = append(removed, instance)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return removed, nil
 }
 
 // TouchHeartbeats replaces only heartbeat_at of the named service's

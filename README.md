@@ -231,6 +231,46 @@ HTTP 200：`service_name` 为所属服务名，`registered` 为成功处理条�
 `invalid_parameter` 且不改变记录；存储不可用时返回 HTTP 503
 `storage_unavailable`。
 
+### 失联实例清理
+
+- `POST /api/v1/cleanup`
+
+独立的失联清理入口，参数从查询参数或 JSON 对象读取：
+
+- `evaluate_at`：评估时刻，必填，接受 RFC3339 时间或 Unix 秒。
+- `heartbeat_timeout`：心跳超时时长，必填且大于零，接受正数秒数或
+  `30s`、`2m` 时长文本。
+- `service_name`：可选。省略时清理全部服务；显式提供时必须非空，
+  且只清理该服务，其他服务的记录不受影响。
+
+失联判定与发现入口一致：仅当 `evaluate_at` 晚于
+`heartbeat_at + heartbeat_timeout` 时才删除记录；恰好等于边界、仍在线，
+以及显式不健康但未超过时限的实例都保留。请求先完成全部校验再产生删除
+结果，本次删除在单个事务中完成，不会留下部分删除。
+
+成功返回 HTTP 200：`evaluate_at` 为本次使用的评估时刻，
+`heartbeat_timeout` 为 JSON 秒数，`removed` 为删除数量，`instances`
+为刚删除的完整实例记录（`service_name`、`instance_id`、`address`、
+`port`、`healthy`、`weight`、`heartbeat_at`），按 `service_name` 升序、
+`instance_id` 升序排列；没有记录被删除时 `removed` 为 0 且
+`instances` 为空数组。
+
+```json
+{
+  "evaluate_at": "2026-10-01T12:10:00Z",
+  "heartbeat_timeout": 300,
+  "removed": 1,
+  "instances": [
+    {"service_name":"billing","instance_id":"i-1","address":"10.0.0.8:8080","port":8080,"healthy":true,"weight":10,"heartbeat_at":"2026-10-01T12:00:00Z"}
+  ]
+}
+```
+
+`evaluate_at` 缺失或无法解析、`heartbeat_timeout` 缺失或不大于零、
+显式 `service_name` 为空，或 `evaluate_at` 早于任一待评估实例的
+`heartbeat_at`，都返回 HTTP 400 `invalid_parameter` 且不修改任何记录；
+存储读写失败返回 HTTP 503 `storage_unavailable`，不留下部分删除结果。
+
 ## 参数错误
 
 `service_name` 为空、`instance_id` 为空、`weight` 缺失或不大于 0、

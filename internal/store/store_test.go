@@ -285,3 +285,55 @@ func TestListAllInstancesReturnsAllServicesOrdered(t *testing.T) {
 		t.Fatalf("unexpected record count %d", count)
 	}
 }
+
+func TestDeleteInstancesRemovesAtomicallyAndReturnsRecords(t *testing.T) {
+	st := openTestStore(t)
+	heartbeat := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	inputs := []InstanceInput{
+		{ServiceName: "svc-a", InstanceID: "i-1", Address: "10.0.0.1:8080",
+			Port: 8080, Healthy: true, Weight: 5, HeartbeatAt: heartbeat},
+		{ServiceName: "svc-a", InstanceID: "i-2", Weight: 2, HeartbeatAt: heartbeat},
+		{ServiceName: "svc-b", InstanceID: "i-1", Weight: 3, HeartbeatAt: heartbeat},
+	}
+	for _, input := range inputs {
+		if _, err := st.UpsertInstance(input); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+	}
+
+	removed, err := st.DeleteInstances([]InstanceKey{
+		{ServiceName: "svc-a", InstanceID: "i-1"},
+		{ServiceName: "svc-b", InstanceID: "i-1"},
+		{ServiceName: "svc-b", InstanceID: "missing"},
+	})
+	if err != nil {
+		t.Fatalf("delete instances: %v", err)
+	}
+	if len(removed) != 2 {
+		t.Fatalf("removed = %d, want 2", len(removed))
+	}
+	// Removed records carry every stored field as of the deletion.
+	first := removed[0]
+	if first.ServiceName != "svc-a" || first.InstanceID != "i-1" ||
+		first.Address != "10.0.0.1:8080" || first.Port != 8080 ||
+		!first.Healthy || first.Weight != 5 || !first.HeartbeatAt.Equal(heartbeat) {
+		t.Fatalf("removed record mismatch: %+v", first)
+	}
+
+	if _, found, _ := st.GetInstance("svc-a", "i-1"); found {
+		t.Fatalf("svc-a/i-1 still stored")
+	}
+	if _, found, _ := st.GetInstance("svc-b", "i-1"); found {
+		t.Fatalf("svc-b/i-1 still stored")
+	}
+	// Records outside the key set are untouched.
+	if _, found, _ := st.GetInstance("svc-a", "i-2"); !found {
+		t.Fatalf("svc-a/i-2 must be kept")
+	}
+
+	// Deleting the same keys again removes nothing.
+	again, err := st.DeleteInstances([]InstanceKey{{ServiceName: "svc-a", InstanceID: "i-1"}})
+	if err != nil || len(again) != 0 {
+		t.Fatalf("second delete = %v, %v", again, err)
+	}
+}

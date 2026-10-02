@@ -84,6 +84,10 @@ func NewRouter(st *store.Store) *gin.Engine {
 	router.POST("/api/v1/services/:serviceName/discover", server.handleDiscover)
 	router.POST("/api/v1/discover", server.handleDiscover)
 
+	// Standalone lost-instance cleanup: deletes strictly-lost records of one
+	// named service, or of every service when service_name is omitted.
+	router.POST("/api/v1/cleanup", server.handleCleanup)
+
 	router.NoRoute(func(c *gin.Context) {
 		// An empty final path segment (e.g. /api/v1/services//instances)
 		// carries an empty service name and must be a parameter error.

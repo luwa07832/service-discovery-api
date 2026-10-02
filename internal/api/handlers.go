@@ -720,3 +720,110 @@ func sortInstances(instances []gin.H) {
 		return stringValue(left["instance_id"]) < stringValue(right["instance_id"])
 	})
 }
+
+// handleCleanup serves the standalone lost-instance cleanup entry. It
+// validates every parameter before touching storage, then deletes only the
+// records strictly past the lost boundary (evaluate_at later than
+// heartbeat_at + heartbeat_timeout) in one atomic store operation. Records
+// exactly on the boundary, still-online records and unhealthy-but-fresh
+// records are kept. Without service_name every service is cleaned; an
+// explicit service_name scopes the cleanup to that one service and leaves
+// every other service untouched.
+func (s *Server) handleCleanup(c *gin.Context) {
+	bag, apiErr := buildParamBag(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+
+	// service_name is optional here: omitted cleans every service, while an
+	// explicit value must be non-empty and scopes the cleanup.
+	serviceName := ""
+	allServices := true
+	if serviceValue, present := bag.get(serviceNameKeys); present {
+		serviceName = strings.TrimSpace(stringValue(serviceValue))
+		if serviceName == "" {
+			writeError(c, errInvalidParameter("service_name must not be empty"))
+			return
+		}
+		allServices = false
+	}
+	evaluateValue, ok := bag.get(evaluateAtKeys)
+	if !ok {
+		writeError(c, errInvalidParameter("evaluate_at is required"))
+		return
+	}
+	evaluateAt, ok := parseTimeValue(evaluateValue)
+	if !ok {
+		writeError(c, errInvalidParameter("evaluate_at must be a valid timestamp"))
+		return
+	}
+	timeoutValue, ok := bag.get(timeoutKeys)
+	if !ok {
+		writeError(c, errInvalidParameter("heartbeat_timeout must be greater than zero"))
+		return
+	}
+	timeout, ok := parseTimeout(timeoutValue)
+	if !ok || timeout <= 0 {
+		writeError(c, errInvalidParameter("heartbeat_timeout must be greater than zero"))
+		return
+	}
+
+	var instances []store.Instance
+	var err error
+	if allServices {
+		instances, err = s.store.ListAllInstances()
+	} else {
+		instances, err = s.store.ListInstances(serviceName)
+	}
+	if err != nil {
+		writeError(c, errStorageUnavailable())
+		return
+	}
+	// The clock-skew guard is part of validation: it runs before any delete.
+	for _, instance := range instances {
+		if evaluateAt.Before(instance.HeartbeatAt) {
+			writeError(c, errInvalidParameter("evaluate_at must not be earlier than heartbeat_at"))
+			return
+		}
+	}
+
+	lost := make([]store.InstanceKey, 0)
+	for _, instance := range instances {
+		if evaluateAt.After(instance.HeartbeatAt.Add(timeout)) {
+			lost = append(lost, store.InstanceKey{
+				ServiceName: instance.ServiceName,
+				InstanceID:  instance.InstanceID,
+			})
+		}
+	}
+
+	removed := make([]store.Instance, 0)
+	if len(lost) > 0 {
+		removed, err = s.store.DeleteInstances(lost)
+		if err != nil {
+			writeError(c, errStorageUnavailable())
+			return
+		}
+	}
+
+	deleted := make([]gin.H, 0, len(removed))
+	for _, instance := range removed {
+		deleted = append(deleted, instanceJSON(instance))
+	}
+	// Removed records are reported by service name, then instance id.
+	sort.SliceStable(deleted, func(i, j int) bool {
+		left, right := deleted[i], deleted[j]
+		if left["service_name"] != right["service_name"] {
+			return stringValue(left["service_name"]) < stringValue(right["service_name"])
+		}
+		return stringValue(left["instance_id"]) < stringValue(right["instance_id"])
+	})
+
+	c.JSON(200, gin.H{
+		"evaluate_at":       evaluateAt.Format(time.RFC3339Nano),
+		"heartbeat_timeout": jsonWeight(timeout.Seconds()),
+		"removed":           len(deleted),
+		"instances":         deleted,
+	})
+}
