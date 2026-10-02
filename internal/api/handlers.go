@@ -508,6 +508,143 @@ func (s *Server) handleBatchUpdateWeight(c *gin.Context) {
 	c.JSON(200, gin.H{"updated": len(instances), "instances": instances})
 }
 
+// handleUpdateHealth changes only the health state of one path-addressed
+// instance. The caller reads healthy from the JSON body or the query
+// parameter (the JSON body wins when both carry it): the JSON field accepts
+// only boolean true or false, the query parameter only the lowercase text
+// true or false. Address, port, weight and heartbeat time keep their
+// current values, no heartbeat is renewed and no lost cleanup runs.
+func (s *Server) handleUpdateHealth(c *gin.Context) {
+	bag, body, apiErr := buildParamBagWithBody(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	instanceID, apiErr := bag.requiredText(instanceIDKeys, "instance_id must not be empty")
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	healthy, apiErr := requireHealthState(bag, body)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	updated, err := s.store.UpdateHealths(serviceName, []store.HealthTarget{
+		{InstanceID: instanceID, Healthy: healthy},
+	})
+	if apiErr := mapTargetError(err); apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	c.JSON(200, gin.H{"instance": instanceJSON(updated[0])})
+}
+
+// requireHealthState resolves the healthy flag for the single-instance
+// health update: a JSON body field wins over the query parameter. The JSON
+// field accepts only boolean true or false; the query parameter accepts
+// only the lowercase text true or false.
+func requireHealthState(bag *paramBag, body map[string]any) (bool, *apiError) {
+	if body != nil {
+		for _, key := range healthKeys {
+			if value, present := body[key]; present {
+				healthy, ok := strictBoolValue(value)
+				if !ok {
+					return false, errInvalidParameter("healthy must be a boolean true or false")
+				}
+				return healthy, nil
+			}
+		}
+	}
+	if value, present := bag.get(healthKeys); present {
+		healthy, ok := strictHealthText(value)
+		if !ok {
+			return false, errInvalidParameter("healthy must be the lowercase text true or false")
+		}
+		return healthy, nil
+	}
+	return false, errInvalidParameter("healthy is required")
+}
+
+// handleBatchUpdateHealth changes only the health state of several
+// instances of one path-addressed service. The body is one JSON object with
+// a non-empty updates list; every entry is validated and every target
+// confirmed to exist before any write, so an invalid or incomplete batch
+// changes no record and the store applies the whole batch atomically.
+func (s *Server) handleBatchUpdateHealth(c *gin.Context) {
+	serviceName := strings.TrimSpace(c.Param("serviceName"))
+	if serviceName == "" {
+		writeError(c, errInvalidParameter("service_name must not be empty"))
+		return
+	}
+	body, apiErr := readJSONObject(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+
+	rawEntries, ok := body["updates"]
+	if !ok {
+		writeError(c, errInvalidParameter("updates must be a non-empty list"))
+		return
+	}
+	entries, ok := rawEntries.([]any)
+	if !ok || len(entries) == 0 {
+		writeError(c, errInvalidParameter("updates must be a non-empty list"))
+		return
+	}
+
+	targets := make([]store.HealthTarget, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, rawEntry := range entries {
+		entry, ok := rawEntry.(map[string]any)
+		if !ok {
+			writeError(c, errInvalidParameter("each instance must be an object"))
+			return
+		}
+		instanceID := strings.TrimSpace(stringValue(entry["instance_id"]))
+		if instanceID == "" {
+			writeError(c, errInvalidParameter("instance_id must not be empty"))
+			return
+		}
+		if _, duplicated := seen[instanceID]; duplicated {
+			writeError(c, errInvalidParameter("instance_id must not be duplicated"))
+			return
+		}
+		healthValue, present := entry["healthy"]
+		if !present {
+			writeError(c, errInvalidParameter("healthy must be a boolean true or false"))
+			return
+		}
+		healthy, ok := strictBoolValue(healthValue)
+		if !ok {
+			writeError(c, errInvalidParameter("healthy must be a boolean true or false"))
+			return
+		}
+		seen[instanceID] = struct{}{}
+		targets = append(targets, store.HealthTarget{
+			InstanceID: instanceID,
+			Healthy:    healthy,
+		})
+	}
+
+	updated, err := s.store.UpdateHealths(serviceName, targets)
+	if apiErr := mapTargetError(err); apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	instances := make([]gin.H, 0, len(updated))
+	for _, instance := range updated {
+		instances = append(instances, instanceJSON(instance))
+	}
+	c.JSON(200, gin.H{"updated": len(instances), "instances": instances})
+}
+
 func mapTargetError(err error) *apiError {
 	switch {
 	case err == nil:

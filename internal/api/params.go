@@ -56,6 +56,15 @@ type paramBag struct {
 }
 
 func buildParamBag(c *gin.Context) (*paramBag, *apiError) {
+	bag, _, apiErr := buildParamBagWithBody(c)
+	return bag, apiErr
+}
+
+// buildParamBagWithBody merges parameters like buildParamBag and also
+// returns the decoded JSON body object, so callers can tell body fields
+// apart from query parameters. The body map is nil when the request does
+// not carry a JSON object body.
+func buildParamBagWithBody(c *gin.Context) (*paramBag, map[string]any, *apiError) {
 	bag := &paramBag{values: make(map[string]any)}
 
 	for key, values := range c.Request.URL.Query() {
@@ -64,15 +73,15 @@ func buildParamBag(c *gin.Context) (*paramBag, *apiError) {
 		}
 	}
 
+	var body map[string]any
 	if c.Request.Body != nil {
 		raw, err := io.ReadAll(c.Request.Body)
 		if err != nil {
-			return nil, errInvalidParameter("request body cannot be read")
+			return nil, nil, errInvalidParameter("request body cannot be read")
 		}
 		if len(bytes.TrimSpace(raw)) > 0 {
-			var body map[string]any
 			if err := json.Unmarshal(raw, &body); err != nil {
-				return nil, errInvalidParameter("request body must be a JSON object")
+				return nil, nil, errInvalidParameter("request body must be a JSON object")
 			}
 			for key, value := range body {
 				bag.values[key] = value
@@ -83,7 +92,7 @@ func buildParamBag(c *gin.Context) (*paramBag, *apiError) {
 	for _, param := range c.Params {
 		bag.values[param.Key] = param.Value
 	}
-	return bag, nil
+	return bag, body, nil
 }
 
 func (b *paramBag) get(keys []string) (any, bool) {
@@ -162,6 +171,23 @@ func parsePortValue(value any) (int64, bool) {
 func strictBoolValue(value any) (bool, bool) {
 	typed, ok := value.(bool)
 	return typed, ok
+}
+
+// strictHealthText accepts only the lowercase text true or false carried by
+// a query parameter. Any other representation is rejected so all
+// implementations agree.
+func strictHealthText(value any) (bool, bool) {
+	text, ok := value.(string)
+	if !ok {
+		return false, false
+	}
+	switch text {
+	case "true":
+		return true, true
+	case "false":
+		return false, true
+	}
+	return false, false
 }
 
 func toFloat(value any) (float64, bool) {

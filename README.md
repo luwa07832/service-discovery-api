@@ -235,6 +235,66 @@ HTTP 404 `instance_not_found`，批量整批不生效；存储失败返回 HTTP 
 （`GET .../instances/{instanceId}/weight`）与发现结果继续按权重降序、
 实例标识升序排列。
 
+### 只修改实例健康状态
+
+- 单实例：`PUT /api/v1/services/{serviceName}/instances/{instanceId}/health`
+- 批量：`PUT /api/v1/services/{serviceName}/instances/health`
+
+调用方只需要提交新健康状态，不必重复提交地址、端口、权重和心跳时间；
+这些字段逐字段保持当前值不变，注册入口的整条覆盖语义也不改变。
+健康更新不创建不存在的实例、不续期心跳，也不触发发现入口的失联删除。
+
+单实例从路径读取服务名与实例标识，`healthy` 从 JSON 请求体或查询参数读取；
+两者同时给出时以 JSON 请求体为准。JSON 字段只接受布尔 `true` 或 `false`，
+查询参数只接受小写文本 `true` 或 `false`。请求体示例（等价于
+`PUT /api/v1/services/billing/instances/i-1/health?healthy=false`，二者同时出现
+时以请求体为准）：
+
+```json
+{"healthy": false}
+```
+
+成功返回 HTTP 200，顶层 `instance` 为修改后的完整记录：
+
+```json
+{"instance":{"service_name":"billing","instance_id":"i-1","address":"10.0.0.8:8080","port":8080,"healthy":false,"weight":10,"heartbeat_at":"2026-10-01T12:00:00Z"}}
+```
+
+批量请求体是单个 JSON 对象，`updates` 为非空数组；每项含 `instance_id`
+与 `healthy`（仅接受布尔 `true`/`false`），同批 `instance_id` 不得重复：
+
+```json
+{
+  "updates": [
+    {"instance_id": "i-1", "healthy": false},
+    {"instance_id": "i-2", "healthy": true}
+  ]
+}
+```
+
+请求先完整校验并确认所有目标存在，全部成立后才在一个事务里统一修改。
+成功返回 HTTP 200，`updated` 为修改条数，`instances` 严格按请求顺序包含
+修改后的完整记录：
+
+```json
+{
+  "updated": 2,
+  "instances": [
+    {"service_name":"billing","instance_id":"i-1","address":"10.0.0.8:8080","port":8080,"healthy":false,"weight":10,"heartbeat_at":"2026-10-01T12:00:00Z"},
+    {"service_name":"billing","instance_id":"i-2","address":"10.0.0.9:8080","port":8080,"healthy":true,"weight":5,"heartbeat_at":"2025-10-01T12:05:00Z"}
+  ]
+}
+```
+
+服务名或实例标识为空、`healthy` 缺失或不符合上述表示（JSON 中不是布尔、
+查询参数不是小写 `true`/`false`），以及批量的请求体不是单个 JSON 对象、
+`updates` 缺失、为空、不是数组、条目不是对象、缺少 `instance_id` 或同批
+重复，均返回 HTTP 400 `invalid_parameter` 且不修改任何记录。目标实例不
+存在时（单实例或批量中的任一条目）返回 HTTP 404 `instance_not_found`，
+批量整批不生效；存储失败返回 HTTP 503 `storage_unavailable`，不留下部分
+更新。修改后健康查询（`GET .../instances/{instanceId}/health`）与发现结果
+立即反映新健康状态。
+
 ### 按服务名发现健康实例
 
 - `GET|POST /api/v1/services/{serviceName}/discover`
