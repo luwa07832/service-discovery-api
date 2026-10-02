@@ -306,7 +306,7 @@ func (s *Server) handleHeartbeat(c *gin.Context) {
 	updated, err := s.store.TouchHeartbeats(serviceName, []store.HeartbeatTarget{
 		{InstanceID: instanceID, HeartbeatAt: heartbeatAt},
 	})
-	if apiErr := mapHeartbeatError(err); apiErr != nil {
+	if apiErr := mapTargetError(err); apiErr != nil {
 		writeError(c, apiErr)
 		return
 	}
@@ -371,7 +371,7 @@ func (s *Server) handleBatchHeartbeat(c *gin.Context) {
 		})
 	}
 	updated, err := s.store.TouchHeartbeats(serviceName, targets)
-	if apiErr := mapHeartbeatError(err); apiErr != nil {
+	if apiErr := mapTargetError(err); apiErr != nil {
 		writeError(c, apiErr)
 		return
 	}
@@ -394,7 +394,121 @@ func requireHeartbeat(bag *paramBag) (time.Time, *apiError) {
 	return heartbeatAt, nil
 }
 
-func mapHeartbeatError(err error) *apiError {
+// handleUpdateWeight changes only the weight of one path-addressed instance.
+// The caller reads weight from the JSON body or the query parameter (the JSON
+// body wins when both carry it) and never resubmits address, port, health
+// state or heartbeat time: every other field keeps its current value.
+func (s *Server) handleUpdateWeight(c *gin.Context) {
+	bag, apiErr := buildParamBag(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	instanceID, apiErr := bag.requiredText(instanceIDKeys, "instance_id must not be empty")
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	weightValue, ok := bag.get(weightKeys)
+	if !ok {
+		writeError(c, errInvalidParameter("weight must be a positive number"))
+		return
+	}
+	weight, ok := positiveNumber(weightValue)
+	if !ok {
+		writeError(c, errInvalidParameter("weight must be a positive number"))
+		return
+	}
+	updated, err := s.store.UpdateWeights(serviceName, []store.WeightTarget{
+		{InstanceID: instanceID, Weight: weight},
+	})
+	if apiErr := mapTargetError(err); apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	c.JSON(200, gin.H{"instance": instanceJSON(updated[0])})
+}
+
+// handleBatchUpdateWeight changes only the weights of several instances of
+// one path-addressed service. The body is one JSON object with a non-empty
+// updates list; every entry is validated and every target confirmed to exist
+// before any write, so an invalid or incomplete batch changes no record and
+// the store applies the whole batch atomically.
+func (s *Server) handleBatchUpdateWeight(c *gin.Context) {
+	bag, apiErr := buildParamBag(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	serviceName := strings.TrimSpace(c.Param("serviceName"))
+	if serviceName == "" {
+		writeError(c, errInvalidParameter("service_name must not be empty"))
+		return
+	}
+
+	rawEntries, ok := bag.get([]string{"updates"})
+	if !ok {
+		writeError(c, errInvalidParameter("updates must be a non-empty list"))
+		return
+	}
+	entries, ok := rawEntries.([]any)
+	if !ok || len(entries) == 0 {
+		writeError(c, errInvalidParameter("updates must be a non-empty list"))
+		return
+	}
+
+	targets := make([]store.WeightTarget, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, rawEntry := range entries {
+		entry, ok := rawEntry.(map[string]any)
+		if !ok {
+			writeError(c, errInvalidParameter("each instance must be an object"))
+			return
+		}
+		instanceID := strings.TrimSpace(stringValue(entry["instance_id"]))
+		if instanceID == "" {
+			writeError(c, errInvalidParameter("instance_id must not be empty"))
+			return
+		}
+		if _, duplicated := seen[instanceID]; duplicated {
+			writeError(c, errInvalidParameter("instance_id must not be duplicated"))
+			return
+		}
+		weightValue, present := entry["weight"]
+		if !present {
+			writeError(c, errInvalidParameter("weight must be a positive number"))
+			return
+		}
+		weight, ok := positiveNumber(weightValue)
+		if !ok {
+			writeError(c, errInvalidParameter("weight must be a positive number"))
+			return
+		}
+		seen[instanceID] = struct{}{}
+		targets = append(targets, store.WeightTarget{
+			InstanceID: instanceID,
+			Weight:     weight,
+		})
+	}
+
+	updated, err := s.store.UpdateWeights(serviceName, targets)
+	if apiErr := mapTargetError(err); apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+	instances := make([]gin.H, 0, len(updated))
+	for _, instance := range updated {
+		instances = append(instances, instanceJSON(instance))
+	}
+	c.JSON(200, gin.H{"updated": len(instances), "instances": instances})
+}
+
+func mapTargetError(err error) *apiError {
 	switch {
 	case err == nil:
 		return nil

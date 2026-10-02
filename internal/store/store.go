@@ -47,6 +47,13 @@ type HeartbeatTarget struct {
 	HeartbeatAt time.Time
 }
 
+// WeightTarget carries one weight change in a batch: the existing instance
+// identified by InstanceID gets only its Weight replaced.
+type WeightTarget struct {
+	InstanceID string
+	Weight     float64
+}
+
 // Open prepares the database file and the schema this service needs.
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
@@ -319,6 +326,71 @@ WHERE service_name = ? AND instance_id = ?`)
 		}
 		if affected == 0 {
 			return nil, ErrInstanceNotFound
+		}
+	}
+
+	updated := make([]Instance, 0, len(targets))
+	for _, target := range targets {
+		row := tx.QueryRow(`
+SELECT service_name, instance_id, address, port, healthy, weight, heartbeat_at
+FROM service_instances
+WHERE service_name = ? AND instance_id = ?`, serviceName, target.InstanceID)
+		instance, err := scanInstance(row)
+		if err == sql.ErrNoRows {
+			return nil, ErrInstanceNotFound
+		}
+		if err != nil {
+			return nil, err
+		}
+		updated = append(updated, instance)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
+// UpdateWeights replaces only weight of the named service's instances. All
+// targets must exist before any row is touched: the existence check runs
+// inside the transaction and a missing target rolls the whole batch back
+// with ErrInstanceNotFound. Updated records are returned in request order.
+func (s *Store) UpdateWeights(serviceName string, targets []WeightTarget) ([]Instance, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	countStatement, err := tx.Prepare(`
+SELECT COUNT(1) FROM service_instances
+WHERE service_name = ? AND instance_id = ?`)
+	if err != nil {
+		return nil, err
+	}
+	defer countStatement.Close()
+
+	for _, target := range targets {
+		var count int
+		if err := countStatement.QueryRow(serviceName, target.InstanceID).Scan(&count); err != nil {
+			return nil, err
+		}
+		if count == 0 {
+			return nil, ErrInstanceNotFound
+		}
+	}
+
+	updateStatement, err := tx.Prepare(`
+UPDATE service_instances SET weight = ?
+WHERE service_name = ? AND instance_id = ?`)
+	if err != nil {
+		return nil, err
+	}
+	defer updateStatement.Close()
+
+	for _, target := range targets {
+		if _, err := updateStatement.Exec(target.Weight, serviceName, target.InstanceID); err != nil {
+			return nil, err
 		}
 	}
 

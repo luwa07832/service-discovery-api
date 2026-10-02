@@ -15,6 +15,9 @@ var emptyServicePaths = []*regexp.Regexp{
 	regexp.MustCompile(`^/api/v1/services/(/instances/batch)/?$`),
 	regexp.MustCompile(`^/api/v1/services/(/discover)/?$`),
 	regexp.MustCompile(`^/api/v1/services/(/instances/[^/]+/heartbeat)/?$`),
+	regexp.MustCompile(`^/api/v1/services/(/instances/weight)/?$`),
+	regexp.MustCompile(`^/api/v1/services/(/instances/[^/]+/weight)/?$`),
+	regexp.MustCompile(`^/api/v1/services/[^/]+/instances/(/weight)/?$`),
 }
 
 // Server wires the store to every public HTTP entry point.
@@ -78,6 +81,12 @@ func NewRouter(st *store.Store) *gin.Engine {
 	router.POST("/api/v1/services/:serviceName/instances/:instanceId/heartbeat", server.handleHeartbeat)
 	router.POST("/api/v1/heartbeat", server.handleBatchHeartbeat)
 
+	// Weight-only updates replace just weight; address, port, health state
+	// and heartbeat time keep their current values, and the upsert
+	// overwrite semantics stay unchanged.
+	router.PUT("/api/v1/services/:serviceName/instances/weight", server.handleBatchUpdateWeight)
+	router.PUT("/api/v1/services/:serviceName/instances/:instanceId/weight", server.handleUpdateWeight)
+
 	// Discovery of healthy instances with heartbeat-lost removal.
 	router.GET("/api/v1/services/:serviceName/discover", server.handleDiscover)
 	router.GET("/api/v1/discover", server.handleDiscover)
@@ -92,19 +101,38 @@ func NewRouter(st *store.Store) *gin.Engine {
 		// carries an empty service name and must be a parameter error.
 		for _, pattern := range emptyServicePaths {
 			if pattern.MatchString(c.Request.URL.Path) {
-				c.Params = gin.Params{{Key: "serviceName", Value: ""}}
 				switch {
 				case strings.HasSuffix(c.Request.URL.Path, "/discover"):
+					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
 					server.handleDiscover(c)
 				case strings.HasSuffix(c.Request.URL.Path, "/heartbeat"):
+					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
 					server.handleHeartbeat(c)
 				case strings.HasSuffix(c.Request.URL.Path, "/instances/batch"):
+					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
 					server.handleBatchUpsertByPath(c)
+				case c.Request.Method == http.MethodPut && strings.HasSuffix(c.Request.URL.Path, "/instances/weight"):
+					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
+					server.handleBatchUpdateWeight(c)
+				case c.Request.Method == http.MethodPut && strings.HasSuffix(c.Request.URL.Path, "/weight"):
+					emptyInstance := strings.HasSuffix(c.Request.URL.Path, "//weight")
+					if emptyInstance {
+						c.Params = gin.Params{
+							{Key: "serviceName", Value: ""},
+							{Key: "instanceId", Value: ""},
+						}
+					} else {
+						c.Params = gin.Params{{Key: "serviceName", Value: ""}}
+					}
+					server.handleUpdateWeight(c)
 				case c.Request.Method == http.MethodDelete || (c.Request.Method == http.MethodPost && strings.HasSuffix(c.Request.URL.Path, "/delete")):
+					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
 					server.handleDelete(c)
 				case c.Request.Method == http.MethodPost:
+					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
 					server.handleUpsert(c)
 				default:
+					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
 					server.handleListInstances(c)
 				}
 				return
