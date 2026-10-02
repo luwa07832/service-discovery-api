@@ -92,6 +92,7 @@ func NewRouter(st *store.Store) *gin.Engine {
 	router.GET("/api/v1/discover", server.handleDiscover)
 	router.POST("/api/v1/services/:serviceName/discover", server.handleDiscover)
 	router.POST("/api/v1/discover", server.handleDiscover)
+	router.POST("/api/v1/discover/batch", server.handleBatchDiscover)
 
 	// Standalone lost-instance cleanup across one or all services.
 	router.POST("/api/v1/cleanup", server.handleCleanup)

@@ -803,6 +803,140 @@ func (s *Server) handleDiscover(c *gin.Context) {
 	})
 }
 
+// handleBatchDiscover implements POST /api/v1/discover/batch. Several
+// services share one evaluation point and timeout. Parameters and stored
+// data are fully validated before any record is removed: every specified
+// service is read first, the clock-skew guard covers every instance of
+// every specified service, and lost records across all services are removed
+// in one transaction so a failure never leaves partial deletions. Services
+// that are not requested are never read or touched; a requested service
+// without records yields an empty instance list while keeping its place in
+// the request order.
+func (s *Server) handleBatchDiscover(c *gin.Context) {
+	body, apiErr := readJSONObject(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+
+	rawNames, present := body["service_names"]
+	if !present {
+		writeError(c, errInvalidParameter("service_names must be a non-empty list of unique service names"))
+		return
+	}
+	entries, ok := rawNames.([]any)
+	if !ok || len(entries) == 0 {
+		writeError(c, errInvalidParameter("service_names must be a non-empty list of unique service names"))
+		return
+	}
+	serviceNames := make([]string, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, rawName := range entries {
+		name, ok := rawName.(string)
+		if !ok {
+			writeError(c, errInvalidParameter("service_names must be a non-empty list of unique service names"))
+			return
+		}
+		name = strings.TrimSpace(name)
+		if name == "" {
+			writeError(c, errInvalidParameter("service_names must be a non-empty list of unique service names"))
+			return
+		}
+		if _, duplicated := seen[name]; duplicated {
+			writeError(c, errInvalidParameter("service_names must not contain duplicates"))
+			return
+		}
+		seen[name] = struct{}{}
+		serviceNames = append(serviceNames, name)
+	}
+
+	evaluateValue, present := body["evaluate_at"]
+	if !present {
+		writeError(c, errInvalidParameter("evaluate_at is required"))
+		return
+	}
+	evaluateAt, ok := parseTimeValue(evaluateValue)
+	if !ok {
+		writeError(c, errInvalidParameter("evaluate_at must be a valid timestamp"))
+		return
+	}
+	timeoutValue, present := body["heartbeat_timeout"]
+	if !present {
+		writeError(c, errInvalidParameter("heartbeat_timeout must be greater than zero"))
+		return
+	}
+	timeout, ok := parseTimeout(timeoutValue)
+	if !ok || timeout <= 0 {
+		writeError(c, errInvalidParameter("heartbeat_timeout must be greater than zero"))
+		return
+	}
+
+	// Read every requested service before any classification or deletion,
+	// so a storage read failure changes nothing.
+	byService := make(map[string][]store.Instance, len(serviceNames))
+	for _, serviceName := range serviceNames {
+		instances, err := s.store.ListInstances(serviceName)
+		if err != nil {
+			writeError(c, errStorageUnavailable())
+			return
+		}
+		byService[serviceName] = instances
+	}
+	// The clock-skew guard covers all records before the lost boundary is
+	// applied, rejecting the whole batch without deleting anything.
+	for _, serviceName := range serviceNames {
+		for _, instance := range byService[serviceName] {
+			if evaluateAt.Before(instance.HeartbeatAt) {
+				writeError(c, errInvalidParameter("evaluate_at must not be earlier than heartbeat_at"))
+				return
+			}
+		}
+	}
+
+	lostKeys := make([]store.InstanceKey, 0)
+	for _, serviceName := range serviceNames {
+		for _, instance := range byService[serviceName] {
+			if evaluateAt.After(instance.HeartbeatAt.Add(timeout)) {
+				lostKeys = append(lostKeys, store.InstanceKey{
+					ServiceName: instance.ServiceName,
+					InstanceID:  instance.InstanceID,
+				})
+			}
+		}
+	}
+	// All lost records are removed atomically across services.
+	if len(lostKeys) > 0 {
+		if err := s.store.DeleteInstances(lostKeys); err != nil {
+			writeError(c, errStorageUnavailable())
+			return
+		}
+	}
+
+	services := make([]gin.H, 0, len(serviceNames))
+	for _, serviceName := range serviceNames {
+		candidates := make([]gin.H, 0)
+		for _, instance := range byService[serviceName] {
+			if evaluateAt.After(instance.HeartbeatAt.Add(timeout)) {
+				continue
+			}
+			if !instance.Healthy {
+				continue
+			}
+			candidates = append(candidates, instanceJSON(instance))
+		}
+		sortDiscoverHits(candidates)
+		services = append(services, gin.H{
+			"service_name": serviceName,
+			"instances":    candidates,
+		})
+	}
+	c.JSON(200, gin.H{
+		"services":          services,
+		"evaluate_at":       evaluateAt.Format(time.RFC3339Nano),
+		"heartbeat_timeout": jsonWeight(timeout.Seconds()),
+	})
+}
+
 // handleCleanup implements the standalone lost-instance cleanup entry. An
 // omitted service_name evaluates every service; an explicit service_name
 // must be non-empty and scopes the cleanup to that one service, leaving

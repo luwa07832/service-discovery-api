@@ -95,6 +95,28 @@ func (b *paramBag) get(keys []string) (any, bool) {
 	return nil, false
 }
 
+// readJSONObject requires the request body to be a single JSON object. An
+// empty body, a JSON array or any non-object payload is a parameter error.
+// It is used by the batch entry points whose contract forbids merging query
+// parameters or accepting a bare value.
+func readJSONObject(c *gin.Context) (map[string]any, *apiError) {
+	if c.Request.Body == nil {
+		return nil, errInvalidParameter("request body must be a JSON object")
+	}
+	raw, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return nil, errInvalidParameter("request body cannot be read")
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, errInvalidParameter("request body must be a JSON object")
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil || body == nil {
+		return nil, errInvalidParameter("request body must be a JSON object")
+	}
+	return body, nil
+}
+
 func stringValue(value any) string {
 	if text, ok := value.(string); ok {
 		return text

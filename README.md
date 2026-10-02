@@ -254,6 +254,53 @@ HTTP 404 `instance_not_found`，批量整批不生效；存储失败返回 HTTP 
 排序规则固定为：权重由高到低；权重相同则按实例标识升序，
 保证同一输入输出顺序确定。
 
+### 批量发现健康实例
+
+- `POST /api/v1/discover/batch`
+
+一次查询多个服务，所有服务共用同一评估时刻与超时时长。请求体必须是单个
+JSON 对象（数组、裸值、空请求体都返回 HTTP 400）：
+
+```json
+{
+  "service_names": ["billing", "gateway"],
+  "evaluate_at": "2026-10-01T12:10:00Z",
+  "heartbeat_timeout": "2m"
+}
+```
+
+- `service_names`：必填的非空字符串数组；每项去除首尾空白后必须非空，
+  去除空白后的名称不能重复，否则返回 HTTP 400 `invalid_parameter`。
+- `evaluate_at`：必填，接受 RFC3339 时间或 Unix 秒。
+- `heartbeat_timeout`：必填且大于零，接受正数秒数或 `30s`、`2m` 时长文本。
+
+处理只读取请求指定的服务：未指定的服务既不读取也不删除。失联判定与单服务
+发现一致，仅当 `evaluate_at` 晚于 `heartbeat_at + heartbeat_timeout` 时判定
+失联，恰好等于边界仍在线；每个服务只把 `healthy` 为 `true` 且未失联的实例
+放入结果，失联实例按同一边界从对应服务删除；显式不健康但未失联的实例保留，
+没有记录的服务返回空实例数组 `[]`。
+
+请求先完成全部参数与数据校验（包括 `evaluate_at` 不得早于任一指定服务内
+任一实例的 `heartbeat_at`），之后才判定失联并删除：任何校验错误都不会
+创建、更新或删除实例。所有失联记录在单个事务内跨服务原子删除，存储读取或
+删除失败返回 HTTP 503 `storage_unavailable`，不会留下部分删除结果。
+
+成功返回 HTTP 200：顶层 `services` 严格按 `service_names` 原顺序排列，
+并含规范化的 `evaluate_at` 和以 JSON 秒数表示的 `heartbeat_timeout`；
+每项含 `service_name` 与 `instances`，实例字段沿用单服务发现，排序同样为
+权重降序、权重相同按 `instance_id` 升序：
+
+```json
+{
+  "services": [
+    {"service_name":"billing","instances":[{"service_name":"billing","instance_id":"i-2","address":"","port":0,"healthy":true,"weight":10,"heartbeat_at":"2026-10-01T12:09:00Z"}]},
+    {"service_name":"gateway","instances":[]}
+  ],
+  "evaluate_at": "2026-10-01T12:10:00Z",
+  "heartbeat_timeout": 120
+}
+```
+
 ### 失联实例清理
 
 - `POST /api/v1/cleanup`
@@ -343,4 +390,4 @@ RFC3339 时间或 Unix 秒）、`heartbeat_timeout`（心跳超时时长，必�
 所有错误响应都是单个顶层 `error` 对象，包含 `code` 与 `message` 两个字符串字段；`message` 不包含 SQL、堆栈或文件路径。
 
 实现只使用上述 SQLite 存储：没有额外持久化文件、后台清理任务或额外数据源；
-发现请求触发的失联清理由请求同步完成，仅删除该服务名下严格超过时限的记录。
+发现请求（含批量发现）触发的失联清理由请求同步完成，仅删除请求指定服务名下严格超过时限的记录；批量发现的跨服务删除在单个事务内原子完成。
