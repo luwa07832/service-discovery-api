@@ -285,3 +285,38 @@ func TestListAllInstancesReturnsAllServicesOrdered(t *testing.T) {
 		t.Fatalf("unexpected record count %d", count)
 	}
 }
+
+func TestDeleteInstancesRemovesOnlyTargetedRecords(t *testing.T) {
+	st := openTestStore(t)
+	heartbeat := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	inputs := []InstanceInput{
+		{ServiceName: "svc-a", InstanceID: "i-1", Weight: 1, HeartbeatAt: heartbeat},
+		{ServiceName: "svc-a", InstanceID: "i-2", Weight: 1, HeartbeatAt: heartbeat},
+		{ServiceName: "svc-b", InstanceID: "i-1", Weight: 1, HeartbeatAt: heartbeat},
+	}
+	for _, input := range inputs {
+		if _, err := st.UpsertInstance(input); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+	}
+
+	if err := st.DeleteInstances([]InstanceKey{
+		{ServiceName: "svc-a", InstanceID: "i-1"},
+		{ServiceName: "svc-b", InstanceID: "i-1"},
+	}); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	for _, key := range [][2]string{{"svc-a", "i-1"}, {"svc-b", "i-1"}} {
+		if _, found, err := st.GetInstance(key[0], key[1]); err != nil || found {
+			t.Fatalf("%s/%s should be deleted: found=%v err=%v", key[0], key[1], found, err)
+		}
+	}
+	remaining, err := st.ListAllInstances()
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].ServiceName != "svc-a" || remaining[0].InstanceID != "i-2" {
+		t.Fatalf("remaining = %+v, want only svc-a/i-2", remaining)
+	}
+}

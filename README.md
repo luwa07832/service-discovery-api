@@ -195,6 +195,42 @@ HTTP 200：`service_name` 为所属服务名，`registered` 为成功处理条�
 排序规则固定为：权重由高到低；权重相同则按实例标识升序，
 保证同一输入输出顺序确定。
 
+### 失联实例清理
+
+- `POST /api/v1/cleanup`
+
+参数从查询参数或 JSON 对象读取：`evaluate_at`（评估时刻，必填，接受
+RFC3339 时间或 Unix 秒）、`heartbeat_timeout`（心跳超时时长，必填且大于零，
+接受正数秒数或 `30s`、`2m` 时长文本）、`service_name`（可选）。省略
+`service_name` 时清理全部服务；显式提供时必须非空，且只清理该服务，
+其他服务的记录不受影响。
+
+失联判定与发现入口一致：仅当 `evaluate_at` 晚于
+`heartbeat_at + heartbeat_timeout` 时才删除记录，恰好等于边界以及仍在线的
+记录必须保留，显式不健康但未超过时限的实例也不会被删除。请求先完成全部
+校验再产生删除结果。清理完成后返回 HTTP 200：
+
+```json
+{
+  "evaluate_at": "2026-10-01T12:10:00Z",
+  "heartbeat_timeout": 300,
+  "removed": 2,
+  "instances": [
+    {"service_name":"alpha","instance_id":"i-1","address":"10.0.0.8:8080","port":8080,"healthy":true,"weight":10,"heartbeat_at":"2026-10-01T12:00:00Z"},
+    {"service_name":"beta","instance_id":"i-1","address":"","port":0,"healthy":false,"weight":5,"heartbeat_at":"2026-10-01T12:01:00Z"}
+  ]
+}
+```
+
+`heartbeat_timeout` 以 JSON 秒数表示；`removed` 为本次删除的记录数；
+`instances` 为刚删除的完整实例记录，按 `service_name` 升序、
+`instance_id` 升序排列；没有任何记录被删除时 `removed` 为 `0` 且
+`instances` 为空数组。`evaluate_at` 缺失或无法解析、`heartbeat_timeout`
+缺失或不大于零、显式 `service_name` 为空，或 `evaluate_at` 早于任一
+待评估实例的 `heartbeat_at`，都返回 HTTP 400 `invalid_parameter`
+且不修改任何记录；存储读写失败返回 HTTP 503 `storage_unavailable`，
+单次清理不会留下部分删除结果。
+
 ### 服务总览（只读）
 
 - `GET /api/v1/services`

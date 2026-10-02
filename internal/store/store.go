@@ -257,6 +257,37 @@ DELETE FROM service_instances WHERE service_name = ? AND instance_id = ?`, servi
 	return affected > 0, nil
 }
 
+// InstanceKey identifies one instance record for a targeted write.
+type InstanceKey struct {
+	ServiceName string
+	InstanceID  string
+}
+
+// DeleteInstances removes the identified records in a single transaction.
+// Any failure rolls the whole batch back, so a failed request never leaves
+// partial deletions behind.
+func (s *Store) DeleteInstances(keys []InstanceKey) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	statement, err := tx.Prepare(`
+DELETE FROM service_instances WHERE service_name = ? AND instance_id = ?`)
+	if err != nil {
+		return err
+	}
+	defer statement.Close()
+
+	for _, key := range keys {
+		if _, err := statement.Exec(key.ServiceName, key.InstanceID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // TouchHeartbeats replaces only heartbeat_at of the named service's
 // instances. The whole batch runs in one transaction: when any target does
 // not exist the transaction rolls back and ErrInstanceNotFound is returned

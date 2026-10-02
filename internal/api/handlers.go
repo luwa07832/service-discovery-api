@@ -689,6 +689,106 @@ func (s *Server) handleDiscover(c *gin.Context) {
 	})
 }
 
+// handleCleanup implements the standalone lost-instance cleanup entry. An
+// omitted service_name evaluates every service; an explicit service_name
+// must be non-empty and scopes the cleanup to that one service, leaving
+// every other service untouched. Only records strictly past the lost
+// boundary are deleted: records exactly on the boundary, still-online
+// records and unhealthy-but-fresh records are all kept. Every parameter is
+// validated before any deletion, and the deletion itself runs in one
+// transaction so a storage failure leaves no partial result.
+func (s *Server) handleCleanup(c *gin.Context) {
+	bag, apiErr := buildParamBag(c)
+	if apiErr != nil {
+		writeError(c, apiErr)
+		return
+	}
+
+	serviceName := ""
+	scoped := false
+	if value, present := bag.get(serviceNameKeys); present {
+		serviceName = strings.TrimSpace(stringValue(value))
+		if serviceName == "" {
+			writeError(c, errInvalidParameter("service_name must not be empty"))
+			return
+		}
+		scoped = true
+	}
+	evaluateValue, ok := bag.get(evaluateAtKeys)
+	if !ok {
+		writeError(c, errInvalidParameter("evaluate_at is required"))
+		return
+	}
+	evaluateAt, ok := parseTimeValue(evaluateValue)
+	if !ok {
+		writeError(c, errInvalidParameter("evaluate_at must be a valid timestamp"))
+		return
+	}
+	timeoutValue, ok := bag.get(timeoutKeys)
+	if !ok {
+		writeError(c, errInvalidParameter("heartbeat_timeout must be greater than zero"))
+		return
+	}
+	timeout, ok := parseTimeout(timeoutValue)
+	if !ok || timeout <= 0 {
+		writeError(c, errInvalidParameter("heartbeat_timeout must be greater than zero"))
+		return
+	}
+
+	var instances []store.Instance
+	var err error
+	if scoped {
+		instances, err = s.store.ListInstances(serviceName)
+	} else {
+		instances, err = s.store.ListAllInstances()
+	}
+	if err != nil {
+		writeError(c, errStorageUnavailable())
+		return
+	}
+	for _, instance := range instances {
+		if evaluateAt.Before(instance.HeartbeatAt) {
+			writeError(c, errInvalidParameter("evaluate_at must not be earlier than heartbeat_at"))
+			return
+		}
+	}
+
+	lost := make([]store.Instance, 0)
+	keys := make([]store.InstanceKey, 0)
+	for _, instance := range instances {
+		if evaluateAt.After(instance.HeartbeatAt.Add(timeout)) {
+			lost = append(lost, instance)
+			keys = append(keys, store.InstanceKey{
+				ServiceName: instance.ServiceName,
+				InstanceID:  instance.InstanceID,
+			})
+		}
+	}
+	if len(keys) > 0 {
+		if err := s.store.DeleteInstances(keys); err != nil {
+			writeError(c, errStorageUnavailable())
+			return
+		}
+	}
+
+	sort.SliceStable(lost, func(i, j int) bool {
+		if lost[i].ServiceName != lost[j].ServiceName {
+			return lost[i].ServiceName < lost[j].ServiceName
+		}
+		return lost[i].InstanceID < lost[j].InstanceID
+	})
+	removed := make([]gin.H, 0, len(lost))
+	for _, instance := range lost {
+		removed = append(removed, instanceJSON(instance))
+	}
+	c.JSON(200, gin.H{
+		"evaluate_at":       evaluateAt.Format(time.RFC3339Nano),
+		"heartbeat_timeout": jsonWeight(timeout.Seconds()),
+		"removed":           len(removed),
+		"instances":         removed,
+	})
+}
+
 // sortDiscoverHits orders discovery hits by weight descending, then instance
 // id ascending, giving deterministic output for identical input.
 func sortDiscoverHits(instances []gin.H) {
