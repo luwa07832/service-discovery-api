@@ -176,6 +176,51 @@ HTTP 200：`service_name` 为所属服务名，`registered` 为成功处理条�
 `storage_unavailable`，同样不留下部分更新。
 续期不改变未命中记录，也不改变后续发现请求的失联判定与清理行为。
 
+### 修改权重
+
+- 单实例：`PUT /api/v1/services/{serviceName}/instances/{instanceId}/weight`
+- 批量：`PUT /api/v1/services/{serviceName}/instances/weight`
+
+权重修改只替换 `weight`，不必重复提交地址、端口、健康状态和心跳时间；
+这些字段逐字段保持当前值不变，时间仍以 RFC3339 表示，注册入口的整条覆盖
+语义也保持不变。`weight` 沿用注册语义：仅接受 JSON 数字或数字字符串中的
+有限正数，缺失、不可解析、非有限值或不大于 0 一律拒绝。
+
+单实例入口从路径读取服务名与实例标识，`weight` 从 JSON 请求体或查询参数
+读取，两者同时给出时以 JSON 请求体为准：
+
+```json
+{"weight": 12.5}
+```
+
+成功返回 HTTP 200，顶层 `instance` 为修改后的完整记录：
+
+```json
+{"instance":{"service_name":"billing","instance_id":"i-1","address":"10.0.0.8:8080","port":8080,"healthy":true,"weight":12.5,"heartbeat_at":"2026-10-01T12:05:00Z"}}
+```
+
+批量入口的请求体是单个 JSON 对象，`updates` 为非空数组，每项含
+`instance_id` 与 `weight`，同批 `instance_id` 不得重复：
+
+```json
+{
+  "updates": [
+    {"instance_id": "i-2", "weight": 7.5},
+    {"instance_id": "i-1", "weight": "1"}
+  ]
+}
+```
+
+请求先完整校验并确认所有目标实例都存在，全部成立后才统一修改。成功返回
+HTTP 200，`updated` 为修改条数，`instances` 严格按请求顺序包含修改后的
+完整记录。请求体不是单个 JSON 对象、服务名或实例标识为空、`weight`
+缺失/不可解析/非有限/不大于 0、`updates` 缺失、为空、不是数组、条目不是
+对象、缺少 `instance_id` 或同批重复，均返回 HTTP 400 `invalid_parameter`
+且不修改任何记录；任一目标实例不存在时单实例与批量都返回 HTTP 404
+`instance_not_found`，批量整批不生效；存储失败返回 HTTP 503
+`storage_unavailable`，批量不会留下部分更新。GET 权重查询与发现结果按
+权重降序、实例标识升序排列的行为不变。
+
 ### 按服务名发现健康实例
 
 - `GET|POST /api/v1/services/{serviceName}/discover`

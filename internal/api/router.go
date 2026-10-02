@@ -15,6 +15,8 @@ var emptyServicePaths = []*regexp.Regexp{
 	regexp.MustCompile(`^/api/v1/services/(/instances/batch)/?$`),
 	regexp.MustCompile(`^/api/v1/services/(/discover)/?$`),
 	regexp.MustCompile(`^/api/v1/services/(/instances/[^/]+/heartbeat)/?$`),
+	regexp.MustCompile(`^/api/v1/services/(/instances/weight)/?$`),
+	regexp.MustCompile(`^/api/v1/services/(/instances/[^/]+/weight)/?$`),
 }
 
 // Server wires the store to every public HTTP entry point.
@@ -78,6 +80,12 @@ func NewRouter(st *store.Store) *gin.Engine {
 	router.POST("/api/v1/services/:serviceName/instances/:instanceId/heartbeat", server.handleHeartbeat)
 	router.POST("/api/v1/heartbeat", server.handleBatchHeartbeat)
 
+	// Weight updates replace only weight; the caller never resubmits
+	// address, port, health state or heartbeat time. The batch entry keeps
+	// its static "weight" segment separate from the single instance path.
+	router.PUT("/api/v1/services/:serviceName/instances/weight", server.handleBatchUpdateWeight)
+	router.PUT("/api/v1/services/:serviceName/instances/:instanceId/weight", server.handleUpdateWeight)
+
 	// Discovery of healthy instances with heartbeat-lost removal.
 	router.GET("/api/v1/services/:serviceName/discover", server.handleDiscover)
 	router.GET("/api/v1/discover", server.handleDiscover)
@@ -98,6 +106,10 @@ func NewRouter(st *store.Store) *gin.Engine {
 					server.handleDiscover(c)
 				case strings.HasSuffix(c.Request.URL.Path, "/heartbeat"):
 					server.handleHeartbeat(c)
+				case strings.HasSuffix(c.Request.URL.Path, "/instances/weight"):
+					server.handleBatchUpdateWeight(c)
+				case strings.HasSuffix(c.Request.URL.Path, "/weight"):
+					server.handleUpdateWeight(c)
 				case strings.HasSuffix(c.Request.URL.Path, "/instances/batch"):
 					server.handleBatchUpsertByPath(c)
 				case c.Request.Method == http.MethodDelete || (c.Request.Method == http.MethodPost && strings.HasSuffix(c.Request.URL.Path, "/delete")):

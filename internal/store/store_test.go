@@ -249,6 +249,76 @@ func TestTouchHeartbeatsMissingInstanceRollsBack(t *testing.T) {
 	}
 }
 
+func TestSetWeightsUpdatesOnlyWeightInRequestOrder(t *testing.T) {
+	st := openTestStore(t)
+	heartbeat := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	seed := InstanceInput{
+		ServiceName: "svc", Address: "10.0.0.1:8080", Port: 8080,
+		Healthy: true, Weight: 7, HeartbeatAt: heartbeat,
+	}
+	first := seed
+	first.InstanceID = "i-1"
+	second := seed
+	second.InstanceID = "i-2"
+	second.Weight = 3
+	if _, err := st.UpsertInstance(first); err != nil {
+		t.Fatalf("upsert i-1: %v", err)
+	}
+	if _, err := st.UpsertInstance(second); err != nil {
+		t.Fatalf("upsert i-2: %v", err)
+	}
+	other := seed
+	other.ServiceName = "svc-other"
+	other.InstanceID = "i-2"
+	if _, err := st.UpsertInstance(other); err != nil {
+		t.Fatalf("upsert other: %v", err)
+	}
+
+	updated, err := st.SetWeights("svc", []WeightTarget{
+		{InstanceID: "i-2", Weight: 42},
+		{InstanceID: "i-1", Weight: 5.5},
+	})
+	if err != nil {
+		t.Fatalf("set weights: %v", err)
+	}
+	if len(updated) != 2 || updated[0].InstanceID != "i-2" || updated[1].InstanceID != "i-1" {
+		t.Fatalf("updated order = %+v", updated)
+	}
+	if updated[0].Weight != 42 || updated[1].Weight != 5.5 {
+		t.Fatalf("weights = %v, %v", updated[0].Weight, updated[1].Weight)
+	}
+
+	got, _, _ := st.GetInstance("svc", "i-1")
+	if got.Address != "10.0.0.1:8080" || got.Port != 8080 || !got.Healthy ||
+		got.Weight != 5.5 || !got.HeartbeatAt.Equal(heartbeat) {
+		t.Fatalf("non-weight fields changed: %+v", got)
+	}
+	if peer, _, _ := st.GetInstance("svc-other", "i-2"); peer.Weight != 7 {
+		t.Fatalf("other service weight changed: %+v", peer)
+	}
+}
+
+func TestSetWeightsMissingInstanceRollsBack(t *testing.T) {
+	st := openTestStore(t)
+	heartbeat := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+	if _, err := st.UpsertInstance(InstanceInput{
+		ServiceName: "svc", InstanceID: "i-1", Weight: 1, HeartbeatAt: heartbeat,
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	_, err := st.SetWeights("svc", []WeightTarget{
+		{InstanceID: "i-1", Weight: 9},
+		{InstanceID: "missing", Weight: 8},
+	})
+	if err != ErrInstanceNotFound {
+		t.Fatalf("err = %v, want ErrInstanceNotFound", err)
+	}
+	if got, _, _ := st.GetInstance("svc", "i-1"); got.Weight != 1 {
+		t.Fatalf("batch was not rolled back: %+v", got)
+	}
+}
+
 func TestListAllInstancesReturnsAllServicesOrdered(t *testing.T) {
 	st := openTestStore(t)
 	heartbeat := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)

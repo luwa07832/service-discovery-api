@@ -47,6 +47,13 @@ type HeartbeatTarget struct {
 	HeartbeatAt time.Time
 }
 
+// WeightTarget carries one weight change in a batch: the existing instance
+// identified by InstanceID gets only its Weight replaced.
+type WeightTarget struct {
+	InstanceID string
+	Weight     float64
+}
+
 // Open prepares the database file and the schema this service needs.
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
@@ -346,6 +353,78 @@ WHERE service_name = ? AND instance_id = ?`, serviceName, target.InstanceID)
 
 type rowScanner interface {
 	Scan(dest ...any) error
+}
+
+// SetWeights replaces only weight of the named service's instances. The whole
+// batch runs in one transaction: every target is confirmed to exist before
+// any UPDATE, so a missing target rolls the batch back with
+// ErrInstanceNotFound without partial updates. Updated records are returned
+// in request order.
+func (s *Store) SetWeights(serviceName string, targets []WeightTarget) ([]Instance, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	check, err := tx.Prepare(`SELECT 1 FROM service_instances
+WHERE service_name = ? AND instance_id = ?`)
+	if err != nil {
+		return nil, err
+	}
+	defer check.Close()
+
+	for _, target := range targets {
+		var marker int
+		if err := check.QueryRow(serviceName, target.InstanceID).Scan(&marker); err == sql.ErrNoRows {
+			return nil, ErrInstanceNotFound
+		} else if err != nil {
+			return nil, err
+		}
+	}
+
+	statement, err := tx.Prepare(`
+UPDATE service_instances SET weight = ?
+WHERE service_name = ? AND instance_id = ?`)
+	if err != nil {
+		return nil, err
+	}
+	defer statement.Close()
+
+	for _, target := range targets {
+		result, err := statement.Exec(target.Weight, serviceName, target.InstanceID)
+		if err != nil {
+			return nil, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if affected == 0 {
+			return nil, ErrInstanceNotFound
+		}
+	}
+
+	updated := make([]Instance, 0, len(targets))
+	for _, target := range targets {
+		row := tx.QueryRow(`
+SELECT service_name, instance_id, address, port, healthy, weight, heartbeat_at
+FROM service_instances
+WHERE service_name = ? AND instance_id = ?`, serviceName, target.InstanceID)
+		instance, err := scanInstance(row)
+		if err == sql.ErrNoRows {
+			return nil, ErrInstanceNotFound
+		}
+		if err != nil {
+			return nil, err
+		}
+		updated = append(updated, instance)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return updated, nil
 }
 
 func scanInstance(scanner rowScanner) (Instance, error) {
