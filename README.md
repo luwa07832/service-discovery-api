@@ -24,6 +24,34 @@ go run .
 
 ## 已公开的入口
 
+### 路径定位优先
+
+凡是路径中包含服务名或实例标识的入口（单实例登记与覆盖、实例及属性
+查询、实例列表、单项心跳续期、单项权重修改、删除、按服务发现），对应
+定位字段始终以路径值为准：
+
+- 请求体或查询参数给出的冲突值、空值、非字符串值以及该字段已支持的
+  同义字段（如 `serviceName`/`service`、`instanceId`/`instance`/`id`）
+  都不能改变目标；
+- 仅当路径未提供某个定位段时（例如参数风格入口或
+  `POST /api/v1/services/{serviceName}/instances` 只在路径中给出服务名），
+  该字段才沿用既有的请求体/查询参数读取规则——因此登记路径只指定服务名时，
+  `instance_id` 仍从现有请求参数取得；
+- 路径定位段去除首尾空白后为空（包括已识别的空路径段，如
+  `/api/v1/services//instances/i-1`）一律返回 HTTP 400 `invalid_parameter`，
+  不能由请求体或查询参数补齐。
+
+例如
+`GET /api/v1/services/alpha/instances/i-1?service_name=beta&instance_id=i-2`
+始终读取 alpha 的 i-1，响应中的 `service_name`、`instance_id` 也与路径一致；
+覆盖、续期、权重修改和删除同样只作用于路径目标。路径目标不存在时，单实例
+读取、续期、权重修改和删除统一返回 HTTP 404 `instance_not_found`，即使冲突
+参数指向另一个存在的实例也不回退；登记入口保留创建或整条覆盖语义，无记录
+服务的列表与发现仍返回 HTTP 200 与空实例数组 `[]`。
+
+其他业务字段（`weight`、`port`、`healthy`、`heartbeat_at`、`evaluate_at`、
+`heartbeat_timeout`、`address` 等）的来源优先级、校验与默认值保持不变。
+
 ### `GET /healthz`
 
 返回服务与存储状态。正常时 HTTP 200：

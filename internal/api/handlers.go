@@ -39,12 +39,15 @@ func (s *Server) handleUpsert(c *gin.Context) {
 		return
 	}
 
-	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	// A path locator wins and cannot be changed by body or query fields; the
+	// collection entry POST .../services/{serviceName}/instances carries no
+	// instance segment, so instance_id keeps its body/query lookup there.
+	serviceName, apiErr := bag.locateText("serviceName", serviceNameKeys, "service_name must not be empty")
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
 	}
-	instanceID, apiErr := bag.requiredText(instanceIDKeys, "instance_id must not be empty")
+	instanceID, apiErr := bag.locateText("instanceId", instanceIDKeys, "instance_id must not be empty")
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
@@ -257,12 +260,12 @@ func (s *Server) handleDelete(c *gin.Context) {
 		writeError(c, apiErr)
 		return
 	}
-	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	serviceName, apiErr := bag.locateText("serviceName", serviceNameKeys, "service_name must not be empty")
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
 	}
-	instanceID, apiErr := bag.requiredText(instanceIDKeys, "instance_id must not be empty")
+	instanceID, apiErr := bag.locateText("instanceId", instanceIDKeys, "instance_id must not be empty")
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
@@ -288,12 +291,12 @@ func (s *Server) handleHeartbeat(c *gin.Context) {
 		writeError(c, apiErr)
 		return
 	}
-	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	serviceName, apiErr := bag.locateText("serviceName", serviceNameKeys, "service_name must not be empty")
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
 	}
-	instanceID, apiErr := bag.requiredText(instanceIDKeys, "instance_id must not be empty")
+	instanceID, apiErr := bag.locateText("instanceId", instanceIDKeys, "instance_id must not be empty")
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
@@ -404,12 +407,12 @@ func (s *Server) handleUpdateWeight(c *gin.Context) {
 		writeError(c, apiErr)
 		return
 	}
-	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	serviceName, apiErr := bag.locateText("serviceName", serviceNameKeys, "service_name must not be empty")
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
 	}
-	instanceID, apiErr := bag.requiredText(instanceIDKeys, "instance_id must not be empty")
+	instanceID, apiErr := bag.locateText("instanceId", instanceIDKeys, "instance_id must not be empty")
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
@@ -629,11 +632,11 @@ func (s *Server) loadInstance(c *gin.Context) (store.Instance, *apiError) {
 	if apiErr != nil {
 		return store.Instance{}, apiErr
 	}
-	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	serviceName, apiErr := bag.locateText("serviceName", serviceNameKeys, "service_name must not be empty")
 	if apiErr != nil {
 		return store.Instance{}, apiErr
 	}
-	instanceID, apiErr := bag.requiredText(instanceIDKeys, "instance_id must not be empty")
+	instanceID, apiErr := bag.locateText("instanceId", instanceIDKeys, "instance_id must not be empty")
 	if apiErr != nil {
 		return store.Instance{}, apiErr
 	}
@@ -708,7 +711,7 @@ func (s *Server) handleListInstances(c *gin.Context) {
 		writeError(c, apiErr)
 		return
 	}
-	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	serviceName, apiErr := bag.locateText("serviceName", serviceNameKeys, "service_name must not be empty")
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
@@ -843,7 +846,7 @@ func (s *Server) handleDiscover(c *gin.Context) {
 		writeError(c, apiErr)
 		return
 	}
-	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	serviceName, apiErr := bag.locateText("serviceName", serviceNameKeys, "service_name must not be empty")
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return

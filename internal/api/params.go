@@ -49,14 +49,19 @@ func writeError(c *gin.Context, e *apiError) {
 	c.JSON(e.status, gin.H{"error": gin.H{"code": e.code, "message": e.message}})
 }
 
-// paramBag merges path parameters, JSON body fields and query parameters.
-// Explicit path parameters win, then body fields, then query parameters.
+// paramBag merges JSON body fields and query parameters, keeping route path
+// parameters separate. Body fields win over query parameters; path
+// parameters are read through locateText and win over both of them.
 type paramBag struct {
 	values map[string]any
+	path   map[string]any
 }
 
 func buildParamBag(c *gin.Context) (*paramBag, *apiError) {
-	bag := &paramBag{values: make(map[string]any)}
+	bag := &paramBag{
+		values: make(map[string]any),
+		path:   make(map[string]any),
+	}
 
 	for key, values := range c.Request.URL.Query() {
 		if len(values) > 0 {
@@ -81,7 +86,7 @@ func buildParamBag(c *gin.Context) (*paramBag, *apiError) {
 	}
 
 	for _, param := range c.Params {
-		bag.values[param.Key] = param.Value
+		bag.path[param.Key] = param.Value
 	}
 	return bag, nil
 }
@@ -93,6 +98,23 @@ func (b *paramBag) get(keys []string) (any, bool) {
 		}
 	}
 	return nil, false
+}
+
+// locateText resolves one locator field (service name or instance id). A
+// value carried by the route path always wins: a conflicting, empty or
+// non-string value of the same field in the body or query string is ignored,
+// and a blank path segment is a parameter error that cannot be filled from
+// another source. Only when the route carries no such segment does the field
+// fall back to the existing body/query lookup rules.
+func (b *paramBag) locateText(pathKey string, keys []string, message string) (string, *apiError) {
+	if raw, fromPath := b.path[pathKey]; fromPath {
+		text := strings.TrimSpace(stringValue(raw))
+		if text == "" {
+			return "", errInvalidParameter(message)
+		}
+		return text, nil
+	}
+	return b.requiredText(keys, message)
 }
 
 // readJSONObject requires the request body to be a single JSON object. An

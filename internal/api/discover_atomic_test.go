@@ -313,8 +313,11 @@ func TestDiscoverRejectedParametersChangeNothing(t *testing.T) {
 		}
 	}
 
+	// On the path entry the path service name always wins, so a conflicting
+	// or blank body service_name is ignored rather than rejected; blank-name
+	// rejection stays covered above through the param-style /api/v1/discover
+	// entry. Every remaining malformed field must still reject the request.
 	postBodies := []map[string]any{
-		{"service_name": "  ", "evaluate_at": at(10), "heartbeat_timeout": "5m"},
 		{"service_name": "svc", "heartbeat_timeout": "5m"},
 		{"service_name": "svc", "evaluate_at": "soon", "heartbeat_timeout": "5m"},
 		{"service_name": "svc", "evaluate_at": at(10)},
