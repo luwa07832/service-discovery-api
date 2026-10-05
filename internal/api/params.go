@@ -252,6 +252,20 @@ func parseHealthValue(value any) (bool, bool) {
 	return false, false
 }
 
+// Accepted timestamps cover [0000-01-01T00:00:00Z, 10000-01-01T00:00:00Z)
+// once converted to UTC: the lower bound is included, the upper bound is
+// excluded. These are exactly the instants the RFC3339 storage format can
+// write and read back, so anything outside could never round-trip.
+var (
+	minAcceptedTime = time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC)
+	maxAcceptedTime = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+)
+
+func inAcceptedTimeRange(t time.Time) bool {
+	t = t.UTC()
+	return !t.Before(minAcceptedTime) && t.Before(maxAcceptedTime)
+}
+
 func parseTimeValue(value any) (time.Time, bool) {
 	switch typed := value.(type) {
 	case string:
@@ -260,17 +274,33 @@ func parseTimeValue(value any) (time.Time, bool) {
 			return time.Time{}, false
 		}
 		if number, err := strconv.ParseFloat(text, 64); err == nil {
-			return unixTime(number), true
+			return unixTimeInRange(number)
 		}
 		for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05", "2006-01-02 15:04:05"} {
 			if parsed, err := time.Parse(layout, text); err == nil {
+				if !inAcceptedTimeRange(parsed) {
+					return time.Time{}, false
+				}
 				return parsed, true
 			}
 		}
 	case float64:
-		return unixTime(typed), true
+		return unixTimeInRange(typed)
 	}
 	return time.Time{}, false
+}
+
+// unixTimeInRange converts a Unix second count that lands inside the
+// accepted range. The range check runs on the float itself, before any int64
+// conversion, so non-finite values (NaN, Inf, Infinity with any sign) and
+// out-of-range finite values are rejected instead of overflowing and
+// wrapping back into a valid-looking date.
+func unixTimeInRange(seconds float64) (time.Time, bool) {
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) ||
+		seconds < float64(minAcceptedTime.Unix()) || seconds >= float64(maxAcceptedTime.Unix()) {
+		return time.Time{}, false
+	}
+	return unixTime(seconds), true
 }
 
 func unixTime(seconds float64) time.Time {
