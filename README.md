@@ -133,7 +133,10 @@ HTTP 200：`service_name` 为所属服务名，`registered` 为成功处理条�
 写入前校验全部条目：请求体不是单个 JSON 对象、`instances` 缺失或为空、
 任一条目缺少或重复 `instance_id`，或 `port`、`healthy`、`weight`、
 `heartbeat_at` 不合规，均返回 HTTP 400 `invalid_parameter` 单个顶层 `error`
-对象，且不创建、不更新任何实例。整批存储失败返回 HTTP 503
+对象，且不创建、不更新任何实例。请求体只允许一个 JSON 对象及其前后的
+JSON 空白：对象结束后多余的闭合符号、第二个 JSON 值或其他内容，以及空
+正文、纯空白、`null`、数组或其他裸值，同样返回该错误，不能通过查询参数
+补救。整批存储失败返回 HTTP 503
 `storage_unavailable`，整批回滚、不留下部分更新。批量注册不触发失联清理，
 也不改变请求之外的任何实例记录。
 
@@ -258,7 +261,10 @@ HTTP 200：`service_name` 为所属服务名，`registered` 为成功处理条�
 请求体不是单个 JSON 对象、服务名或实例标识为空、`weight` 缺失、不可解析、
 非有限值或不大于 0，以及批量的 `updates` 缺失、为空、不是数组、条目不是
 对象、缺少 `instance_id` 或同批重复，均返回 HTTP 400 `invalid_parameter`
-且不修改任何记录。目标实例不存在时（单实例或批量中的任一条目）返回
+且不修改任何记录。与批量注册一致，请求体只允许一个 JSON 对象及其前后的
+JSON 空白：对象结束后多余的闭合符号、第二个 JSON 值或其他内容，以及空
+正文、纯空白、`null`、数组或其他裸值，同样返回该错误，不能通过查询参数
+补救。目标实例不存在时（单实例或批量中的任一条目）返回
 HTTP 404 `instance_not_found`，批量整批不生效；存储失败返回 HTTP 503
 `storage_unavailable`，不留下部分更新。修改后权重查询
 （`GET .../instances/{instanceId}/weight`）与发现结果继续按权重降序、

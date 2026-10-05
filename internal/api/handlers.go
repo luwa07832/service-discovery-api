@@ -138,10 +138,12 @@ func (s *Server) handleBatchUpsertByBody(c *gin.Context) {
 }
 
 // handleBatchUpsert registers or overwrites several instances of one service
-// in one request. Every entry is validated before any write, so an invalid
-// batch changes no record; the store applies the whole batch atomically.
+// in one request. The body must be exactly one JSON object (only JSON
+// whitespace may surround it); every entry is validated before any write, so
+// an invalid batch changes no record; the store applies the whole batch
+// atomically.
 func (s *Server) handleBatchUpsert(c *gin.Context, pathServiceName string, serviceNameFromPath bool) {
-	bag, apiErr := buildParamBag(c)
+	bag, apiErr := buildStrictParamBag(c)
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
@@ -438,12 +440,13 @@ func (s *Server) handleUpdateWeight(c *gin.Context) {
 }
 
 // handleBatchUpdateWeight changes only the weights of several instances of
-// one path-addressed service. The body is one JSON object with a non-empty
-// updates list; every entry is validated and every target confirmed to exist
-// before any write, so an invalid or incomplete batch changes no record and
-// the store applies the whole batch atomically.
+// one path-addressed service. The body must be exactly one JSON object (only
+// JSON whitespace may surround it) with a non-empty updates list; every entry
+// is validated and every target confirmed to exist before any write, so an
+// invalid or incomplete batch changes no record and the store applies the
+// whole batch atomically.
 func (s *Server) handleBatchUpdateWeight(c *gin.Context) {
-	bag, apiErr := buildParamBag(c)
+	bag, apiErr := buildStrictParamBag(c)
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return

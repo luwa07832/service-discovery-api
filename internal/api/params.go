@@ -59,24 +59,13 @@ type paramBag struct {
 }
 
 func buildParamBag(c *gin.Context) (*paramBag, *apiError) {
-	bag := &paramBag{
-		values: make(map[string]any),
-		path:   make(map[string]any),
-	}
-
-	for key, values := range c.Request.URL.Query() {
-		if len(values) > 0 {
-			bag.values[key] = values[0]
-		}
-	}
-
+	var body map[string]any
 	if c.Request.Body != nil {
 		raw, err := io.ReadAll(c.Request.Body)
 		if err != nil {
 			return nil, errInvalidParameter("request body cannot be read")
 		}
 		if len(bytes.TrimSpace(raw)) > 0 {
-			var body map[string]any
 			// UseNumber keeps every JSON number as its literal text so
 			// integer fields (port) can be parsed exactly, without the
 			// float64 rounding that json.Unmarshal would apply.
@@ -88,16 +77,68 @@ func buildParamBag(c *gin.Context) (*paramBag, *apiError) {
 			if decoder.More() {
 				return nil, errInvalidParameter("request body must be a JSON object")
 			}
-			for key, value := range body {
-				bag.values[key] = value
-			}
 		}
 	}
+	return assembleParamBag(c, body), nil
+}
 
+// buildStrictParamBag serves the batch entries whose contract admits exactly
+// one JSON object as the request body: the two batch registration entries and
+// the path-style batch weight update. Unlike buildParamBag, the body is
+// mandatory and must be a single JSON object surrounded only by JSON
+// whitespace: an empty or blank body, a bare value (null, array, string,
+// number, boolean) and any extra content after the object — a stray closing
+// brace or bracket, a second JSON value, other bytes — are all a parameter
+// error that no query parameter can fix. Number literals keep their exact
+// text (UseNumber) so integer fields such as port parse without float64
+// rounding.
+func buildStrictParamBag(c *gin.Context) (*paramBag, *apiError) {
+	if c.Request.Body == nil {
+		return nil, errInvalidParameter("request body must be a JSON object")
+	}
+	raw, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return nil, errInvalidParameter("request body cannot be read")
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, errInvalidParameter("request body must be a JSON object")
+	}
+	var body map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	// A JSON null decodes without error into a nil map; it is not an object.
+	if err := decoder.Decode(&body); err != nil || body == nil {
+		return nil, errInvalidParameter("request body must be a JSON object")
+	}
+	// Only JSON whitespace may follow the single object. decoder.More would
+	// not catch a trailing '}' or ']', so the remaining bytes are checked
+	// directly from the decoder position.
+	if rest := bytes.TrimSpace(raw[decoder.InputOffset():]); len(rest) > 0 {
+		return nil, errInvalidParameter("request body must be a JSON object")
+	}
+	return assembleParamBag(c, body), nil
+}
+
+// assembleParamBag merges query parameters, decoded body fields and path
+// parameters into one bag. Body fields win over query parameters; path
+// parameters stay separate and win over both through locateText.
+func assembleParamBag(c *gin.Context, body map[string]any) *paramBag {
+	bag := &paramBag{
+		values: make(map[string]any),
+		path:   make(map[string]any),
+	}
+	for key, values := range c.Request.URL.Query() {
+		if len(values) > 0 {
+			bag.values[key] = values[0]
+		}
+	}
+	for key, value := range body {
+		bag.values[key] = value
+	}
 	for _, param := range c.Params {
 		bag.path[param.Key] = param.Value
 	}
-	return bag, nil
+	return bag
 }
 
 func (b *paramBag) get(keys []string) (any, bool) {
