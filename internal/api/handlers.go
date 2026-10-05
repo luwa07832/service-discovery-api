@@ -834,7 +834,10 @@ type serviceCounters struct {
 // healthy instances whose last heartbeat is not strictly past the lost
 // boundary are returned. An instance exactly on the boundary is still
 // online. Records strictly past the boundary are removed by the lost
-// cleanup; online and unhealthy-but-fresh records are never touched.
+// cleanup in one transaction, so a storage failure rolls every deletion
+// back and the request returns 503 without a candidate list rather than a
+// discovery result with partial deletions; online and unhealthy-but-fresh
+// records are never touched.
 func (s *Server) handleDiscover(c *gin.Context) {
 	bag, apiErr := buildParamBag(c)
 	if apiErr != nil {
@@ -879,10 +882,13 @@ func (s *Server) handleDiscover(c *gin.Context) {
 		}
 	}
 	candidates := make([]gin.H, 0, len(instances))
-	lost := make([]store.Instance, 0)
+	lostKeys := make([]store.InstanceKey, 0)
 	for _, instance := range instances {
 		if evaluateAt.After(instance.HeartbeatAt.Add(timeout)) {
-			lost = append(lost, instance)
+			lostKeys = append(lostKeys, store.InstanceKey{
+				ServiceName: instance.ServiceName,
+				InstanceID:  instance.InstanceID,
+			})
 			continue
 		}
 		if !instance.Healthy {
@@ -892,9 +898,12 @@ func (s *Server) handleDiscover(c *gin.Context) {
 	}
 	// Lost cleanup deletes records strictly past the timeout. It runs only
 	// after the request is fully validated, so a rejected query changes
-	// nothing.
-	for _, instance := range lost {
-		if _, err := s.store.DeleteInstance(instance.ServiceName, instance.InstanceID); err != nil {
+	// nothing. Every lost record is removed in one transaction: a storage
+	// failure rolls the whole cleanup back, so a request either deletes all
+	// lost records or none of them, and a failed request returns no
+	// candidates rather than a discovery result with partial deletions.
+	if len(lostKeys) > 0 {
+		if err := s.store.DeleteInstances(lostKeys); err != nil {
 			writeError(c, errStorageUnavailable())
 			return
 		}
