@@ -2,26 +2,12 @@ package api
 
 import (
 	"net/http"
-	"regexp"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/luwa07832/service-discovery-api/internal/store"
 )
-
-var emptyServicePaths = []*regexp.Regexp{
-	regexp.MustCompile(`^/api/v1/services/(/instances)?/?$`),
-	regexp.MustCompile(`^/api/v1/services/(/instances/batch)/?$`),
-	regexp.MustCompile(`^/api/v1/services/(/discover)/?$`),
-	regexp.MustCompile(`^/api/v1/services/(/instances/[^/]+/heartbeat)/?$`),
-	regexp.MustCompile(`^/api/v1/services/(/instances/weight)/?$`),
-	regexp.MustCompile(`^/api/v1/services/(/instances/[^/]+/weight)/?$`),
-	regexp.MustCompile(`^/api/v1/services/(/instances/health)/?$`),
-	regexp.MustCompile(`^/api/v1/services/(/instances/[^/]+/health)/?$`),
-	regexp.MustCompile(`^/api/v1/services/[^/]+/instances/(/health)/?$`),
-	regexp.MustCompile(`^/api/v1/services/[^/]+/instances/(/weight)/?$`),
-}
 
 // Server wires the store to every public HTTP entry point.
 type Server struct {
@@ -33,6 +19,10 @@ type Server struct {
 func NewRouter(st *store.Store) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
+	// An empty final segment (e.g. /services/svc/instances//) would otherwise
+	// be hidden behind a trailing-slash redirect; it must reach the entry
+	// point as the empty locator it is so it answers invalid_parameter.
+	router.RedirectTrailingSlash = false
 	router.Use(gin.Recovery())
 
 	server := &Server{store: st}
@@ -107,62 +97,105 @@ func NewRouter(st *store.Store) *gin.Engine {
 	router.POST("/api/v1/cleanup", server.handleCleanup)
 
 	router.NoRoute(func(c *gin.Context) {
-		// An empty final path segment (e.g. /api/v1/services//instances)
-		// carries an empty service name and must be a parameter error.
-		for _, pattern := range emptyServicePaths {
-			if pattern.MatchString(c.Request.URL.Path) {
-				switch {
-				case strings.HasSuffix(c.Request.URL.Path, "/discover"):
-					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
-					server.handleDiscover(c)
-				case strings.HasSuffix(c.Request.URL.Path, "/heartbeat"):
-					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
-					server.handleHeartbeat(c)
-				case strings.HasSuffix(c.Request.URL.Path, "/instances/batch"):
-					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
-					server.handleBatchUpsertByPath(c)
-				case c.Request.Method == http.MethodPut && strings.HasSuffix(c.Request.URL.Path, "/instances/weight"):
-					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
-					server.handleBatchUpdateWeight(c)
-				case c.Request.Method == http.MethodPut && strings.HasSuffix(c.Request.URL.Path, "/instances/health"):
-					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
-					server.handleBatchUpdateHealth(c)
-				case c.Request.Method == http.MethodPut && strings.HasSuffix(c.Request.URL.Path, "/health"):
-					emptyInstance := strings.HasSuffix(c.Request.URL.Path, "//health")
-					if emptyInstance {
-						c.Params = gin.Params{
-							{Key: "serviceName", Value: ""},
-							{Key: "instanceId", Value: ""},
-						}
-					} else {
-						c.Params = gin.Params{{Key: "serviceName", Value: ""}}
-					}
-					server.handleUpdateHealth(c)
-				case c.Request.Method == http.MethodPut && strings.HasSuffix(c.Request.URL.Path, "/weight"):
-					emptyInstance := strings.HasSuffix(c.Request.URL.Path, "//weight")
-					if emptyInstance {
-						c.Params = gin.Params{
-							{Key: "serviceName", Value: ""},
-							{Key: "instanceId", Value: ""},
-						}
-					} else {
-						c.Params = gin.Params{{Key: "serviceName", Value: ""}}
-					}
-					server.handleUpdateWeight(c)
-				case c.Request.Method == http.MethodDelete || (c.Request.Method == http.MethodPost && strings.HasSuffix(c.Request.URL.Path, "/delete")):
-					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
-					server.handleDelete(c)
-				case c.Request.Method == http.MethodPost:
-					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
+		// Classify the path by shape instead of relying on gin's wildcard
+		// parameters: an empty wildcard is dropped in some positions, and an
+		// empty final segment becomes a redirect otherwise. Every recognized
+		// shape is sent to its real handler so a blank service or instance
+		// segment answers invalid_parameter instead of falling back to query
+		// parameters, while genuinely unknown paths stay 404s.
+		shape := parseServicesPath(c.Request.Method, c.Request.URL.Path)
+		if !shape.matched {
+			c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"code": "route_not_found", "message": "no route matches this path"}})
+			return
+		}
+		if shape.hasService {
+			c.Params = append(c.Params, gin.Param{Key: "serviceName", Value: shape.service})
+		}
+		if shape.hasInstance {
+			c.Params = append(c.Params, gin.Param{Key: "instanceId", Value: shape.instance})
+		}
+
+		switch shape.kind {
+		case shapeDiscover:
+			server.handleDiscover(c)
+		case shapeCollection:
+			// A blank service segment is a parameter error on any verb; the
+			// list handler reports it uniformly. A concrete service only
+			// accepts the registered GET (list) and POST (register) verbs.
+			if strings.TrimSpace(shape.service) == "" {
+				server.handleListInstances(c)
+			} else {
+				switch c.Request.Method {
+				case http.MethodGet:
+					server.handleListInstances(c)
+				case http.MethodPost:
 					server.handleUpsert(c)
 				default:
-					c.Params = gin.Params{{Key: "serviceName", Value: ""}}
-					server.handleListInstances(c)
+					routeNotFound(c)
 				}
-				return
 			}
+		case shapeBatchRegister:
+			server.handleBatchUpsertByPath(c)
+		case shapeBatchWeight:
+			server.handleBatchUpdateWeight(c)
+		case shapeBatchHealth:
+			server.handleBatchUpdateHealth(c)
+		case shapeItem:
+			switch c.Request.Method {
+			case http.MethodGet:
+				server.handleGetInstance(c)
+			case http.MethodPut:
+				server.handleUpsert(c)
+			case http.MethodDelete:
+				server.handleDelete(c)
+			default:
+				routeNotFound(c)
+			}
+		case shapeItemAction:
+			switch shape.action {
+			case "heartbeat":
+				switch c.Request.Method {
+				case http.MethodGet:
+					server.handleGetHeartbeat(c)
+				case http.MethodPost:
+					server.handleHeartbeat(c)
+				default:
+					routeNotFound(c)
+				}
+			case "weight":
+				switch c.Request.Method {
+				case http.MethodGet:
+					server.handleGetWeight(c)
+				case http.MethodPut:
+					server.handleUpdateWeight(c)
+				default:
+					routeNotFound(c)
+				}
+			case "health":
+				switch c.Request.Method {
+				case http.MethodGet:
+					server.handleGetHealth(c)
+				case http.MethodPut:
+					server.handleUpdateHealth(c)
+				default:
+					routeNotFound(c)
+				}
+			case "delete":
+				if c.Request.Method == http.MethodPost {
+					server.handleDelete(c)
+				} else {
+					routeNotFound(c)
+				}
+			default:
+				routeNotFound(c)
+			}
+		default:
+			routeNotFound(c)
 		}
-		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"code": "route_not_found", "message": "no route matches this path"}})
 	})
 	return router
+}
+
+func routeNotFound(c *gin.Context) {
+	c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"code": "route_not_found", "message": "no route matches this path"}})
 }

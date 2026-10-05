@@ -79,10 +79,10 @@ func buildParamBag(c *gin.Context) (*paramBag, *apiError) {
 			}
 		}
 	}
-
-	for _, param := range c.Params {
-		bag.values[param.Key] = param.Value
-	}
+	// Path parameters are deliberately not merged into the bag. On path-style
+	// entries they are resolved through resolveLocator so they always win; on
+	// parameter-style entries no path parameter exists and merging would let a
+	// matched path fragment masquerade as a request parameter.
 	return bag, nil
 }
 

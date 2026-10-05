@@ -314,7 +314,6 @@ func TestDiscoverRejectedParametersChangeNothing(t *testing.T) {
 	}
 
 	postBodies := []map[string]any{
-		{"service_name": "  ", "evaluate_at": at(10), "heartbeat_timeout": "5m"},
 		{"service_name": "svc", "heartbeat_timeout": "5m"},
 		{"service_name": "svc", "evaluate_at": "soon", "heartbeat_timeout": "5m"},
 		{"service_name": "svc", "evaluate_at": at(10)},
@@ -331,11 +330,45 @@ func TestDiscoverRejectedParametersChangeNothing(t *testing.T) {
 		}
 	}
 
+	// A blank or conflicting service_name in the JSON body must not override
+	// the path value: the request stays valid and targets the path service.
+	// These valid requests run the lost cleanup, so they come after the
+	// nothing-changed assertions below.
+
+	// An empty service segment in the path itself stays a parameter error
+	// even when the body supplies a valid service name.
+	rec := doRequest(t, router, http.MethodPost, "/api/v1/services//discover",
+		map[string]any{"service_name": "svc", "evaluate_at": at(10), "heartbeat_timeout": "5m"})
+	expectParameterError(t, rec)
+
 	// No rejected request deleted or altered anything, including the two
 	// strictly lost records that a valid request would have removed.
 	expectRecords(t, router, atomicFixtureRecords())
 	if other, err := st.ListInstances("other"); err != nil || len(other) != 1 {
 		t.Fatalf("other service changed: %v err=%v", other, err)
+	}
+
+	for _, body := range []map[string]any{
+		{"service_name": "  ", "evaluate_at": at(10), "heartbeat_timeout": "5m"},
+		{"service_name": "other", "evaluate_at": at(10), "heartbeat_timeout": "5m"},
+		{"service": "other", "evaluate_at": at(10), "heartbeat_timeout": "5m"},
+	} {
+		rec := doRequest(t, router, http.MethodPost, "/api/v1/services/svc/discover", body)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%v: path service must win, got %d %s", body, rec.Code, rec.Body.String())
+		}
+		out := decodeBody(t, rec)
+		if out["service_name"] != "svc" {
+			t.Fatalf("%v: targeted %v, want svc", body, out["service_name"])
+		}
+		if ids := instanceIDs(t, out); len(ids) != 2 || ids[0] != "fresh-high" || ids[1] != "fresh-low" {
+			t.Fatalf("%v: ids = %v, want the healthy fresh svc instances", body, ids)
+		}
+		// The other service must never be read or cleaned by a svc-scoped
+		// discovery, even when the body tries to rename it.
+		if other, err := st.ListInstances("other"); err != nil || len(other) != 1 {
+			t.Fatalf("%v: other service touched: %v err=%v", body, other, err)
+		}
 	}
 }
 

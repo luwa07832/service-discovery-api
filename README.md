@@ -122,6 +122,31 @@ HTTP 200：`service_name` 为所属服务名，`registered` 为成功处理条�
 删除另有 `POST /api/v1/services/{serviceName}/instances/{instanceId}/delete`
 与 `POST /api/v1/deregister`。
 
+### 路径定位优先
+
+凡是公开路径中出现的定位字段（`{serviceName}`，以及单实例入口上的
+`{instanceId}`），始终以路径中的值为准：
+
+- 请求体或查询参数给出的冲突值、空值、非字符串值，以及已支持的同义字段
+  （如 `serviceName`、`service`、`instanceId`、`instance`、`id`）都不能
+  改变路径确定的目标，响应中的 `service_name`、`instance_id` 也与路径一致。
+- 仅当路径没有提供某个定位字段时，才沿用该字段现有的请求体/查询参数读取
+  规则。例如 `POST /api/v1/services/{serviceName}/instances` 只在路径中
+  指定服务名，实例标识仍从现有请求参数取得；参数风格入口
+  （`/api/v1/instances` 等）没有任何路径定位字段，行为保持原样。
+- 路径定位段为空，或去除首尾空白后为空（如
+  `/api/v1/services//instances/i-1`、`/api/v1/services/svc/instances/%20`），
+  返回 HTTP 400 `invalid_parameter`，不能借请求体或查询参数补齐。
+- 路径目标不存在时，单实例读取、心跳续期、权重修改与删除统一返回
+  HTTP 404 `instance_not_found`，即使冲突参数指向另一个存在的实例也不
+  回退；登记仍保留创建或整条覆盖语义，无记录服务的实例列表与发现仍返回
+  HTTP 200 与空实例数组。
+
+该规则适用于单项登记与覆盖、实例及属性查询、实例列表、单项心跳续期、
+单项权重修改、删除，以及按服务名发现的路径入口；其他业务字段的来源
+优先级、校验和默认值不受影响。
+
+
 ### 心跳续期
 
 - 单实例：`POST /api/v1/services/{serviceName}/instances/{instanceId}/heartbeat`

@@ -39,12 +39,11 @@ func (s *Server) handleUpsert(c *gin.Context) {
 		return
 	}
 
-	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
-	if apiErr != nil {
-		writeError(c, apiErr)
-		return
-	}
-	instanceID, apiErr := bag.requiredText(instanceIDKeys, "instance_id must not be empty")
+	// The item route and parameter-style entries resolve both locators here.
+	// The collection route's shape carries no instance segment, so the
+	// resolver falls back to the existing query/body lookup for it: only its
+	// service name is path-authoritative.
+	serviceName, instanceID, apiErr := resolveLocator(c, bag, locServiceAndInstance)
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
@@ -257,12 +256,7 @@ func (s *Server) handleDelete(c *gin.Context) {
 		writeError(c, apiErr)
 		return
 	}
-	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
-	if apiErr != nil {
-		writeError(c, apiErr)
-		return
-	}
-	instanceID, apiErr := bag.requiredText(instanceIDKeys, "instance_id must not be empty")
+	serviceName, instanceID, apiErr := resolveLocator(c, bag, locServiceAndInstance)
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
@@ -288,12 +282,7 @@ func (s *Server) handleHeartbeat(c *gin.Context) {
 		writeError(c, apiErr)
 		return
 	}
-	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
-	if apiErr != nil {
-		writeError(c, apiErr)
-		return
-	}
-	instanceID, apiErr := bag.requiredText(instanceIDKeys, "instance_id must not be empty")
+	serviceName, instanceID, apiErr := resolveLocator(c, bag, locServiceAndInstance)
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
@@ -404,12 +393,7 @@ func (s *Server) handleUpdateWeight(c *gin.Context) {
 		writeError(c, apiErr)
 		return
 	}
-	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
-	if apiErr != nil {
-		writeError(c, apiErr)
-		return
-	}
-	instanceID, apiErr := bag.requiredText(instanceIDKeys, "instance_id must not be empty")
+	serviceName, instanceID, apiErr := resolveLocator(c, bag, locServiceAndInstance)
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
@@ -629,11 +613,7 @@ func (s *Server) loadInstance(c *gin.Context) (store.Instance, *apiError) {
 	if apiErr != nil {
 		return store.Instance{}, apiErr
 	}
-	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
-	if apiErr != nil {
-		return store.Instance{}, apiErr
-	}
-	instanceID, apiErr := bag.requiredText(instanceIDKeys, "instance_id must not be empty")
+	serviceName, instanceID, apiErr := resolveLocator(c, bag, locServiceAndInstance)
 	if apiErr != nil {
 		return store.Instance{}, apiErr
 	}
@@ -708,7 +688,7 @@ func (s *Server) handleListInstances(c *gin.Context) {
 		writeError(c, apiErr)
 		return
 	}
-	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	serviceName, _, apiErr := resolveLocator(c, bag, locServiceOnly)
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
@@ -843,7 +823,7 @@ func (s *Server) handleDiscover(c *gin.Context) {
 		writeError(c, apiErr)
 		return
 	}
-	serviceName, apiErr := bag.requiredText(serviceNameKeys, "service_name must not be empty")
+	serviceName, _, apiErr := resolveLocator(c, bag, locServiceOnly)
 	if apiErr != nil {
 		writeError(c, apiErr)
 		return
