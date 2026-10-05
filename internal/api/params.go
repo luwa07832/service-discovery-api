@@ -70,28 +70,16 @@ func buildParamBag(c *gin.Context) (*paramBag, *apiError) {
 		}
 	}
 
-	if c.Request.Body != nil {
-		raw, err := io.ReadAll(c.Request.Body)
-		if err != nil {
-			return nil, errInvalidParameter("request body cannot be read")
-		}
-		if len(bytes.TrimSpace(raw)) > 0 {
-			var body map[string]any
-			// UseNumber keeps every JSON number as its literal text so
-			// integer fields (port) can be parsed exactly, without the
-			// float64 rounding that json.Unmarshal would apply.
-			decoder := json.NewDecoder(bytes.NewReader(raw))
-			decoder.UseNumber()
-			if err := decoder.Decode(&body); err != nil {
-				return nil, errInvalidParameter("request body must be a JSON object")
-			}
-			if decoder.More() {
-				return nil, errInvalidParameter("request body must be a JSON object")
-			}
-			for key, value := range body {
-				bag.values[key] = value
-			}
-		}
+	// A non-whitespace body must be exactly one JSON object; a JSON null,
+	// array or other bare value, a truncated object, or any trailing token
+	// is a parameter error even when the query string alone would be
+	// sufficient, so it can never silently fall through to query handling.
+	body, apiErr := readOptionalObjectBody(c)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	for key, value := range body {
+		bag.values[key] = value
 	}
 
 	for _, param := range c.Params {
@@ -100,40 +88,68 @@ func buildParamBag(c *gin.Context) (*paramBag, *apiError) {
 	return bag, nil
 }
 
-// readStrictObjectBody requires the body to be exactly one JSON object
-// surrounded only by JSON whitespace. It is used by the batch entries whose
-// contract forbids query-parameter merging: a missing/empty body, a JSON
-// null, array or other bare value, a second JSON value, or a stray closing
-// bracket after the object are all parameter errors, even when the first
-// object carries complete, valid entries.
+// decodeSingleJSONObject decodes raw as exactly one JSON object surrounded
+// only by JSON whitespace. It rejects a JSON null, array or other bare value,
+// a truncated value, and any trailing content: a stray "}" or "]", a second
+// JSON value, or other non-whitespace text, whether glued to the object or
+// separated by whitespace.
 //
 // Decoder.More cannot be used to check completeness: it reports false for a
 // dangling "}" or "]" because those are not value tokens. A second Decode
 // must therefore return exactly io.EOF, which is true only once the object
 // has ended and nothing but whitespace remains.
-func readStrictObjectBody(c *gin.Context) (map[string]any, *apiError) {
+func decodeSingleJSONObject(raw []byte) (map[string]any, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	// UseNumber keeps every JSON number as its literal text so
+	// integer fields (port) can be parsed exactly, without the
+	// float64 rounding that json.Unmarshal would apply.
+	decoder.UseNumber()
+	var body map[string]any
+	if err := decoder.Decode(&body); err != nil || body == nil {
+		return nil, false
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, false
+	}
+	return body, true
+}
+
+// readOptionalObjectBody reads a body that may be omitted entirely. A missing
+// or whitespace-only body yields a nil object and no error, so entries that
+// accept query-only requests keep working; any other content must be exactly
+// one JSON object (see decodeSingleJSONObject).
+func readOptionalObjectBody(c *gin.Context) (map[string]any, *apiError) {
 	if c.Request.Body == nil {
-		return nil, errInvalidParameter("request body must be a JSON object")
+		return nil, nil
 	}
 	raw, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		return nil, errInvalidParameter("request body cannot be read")
 	}
 	if len(bytes.TrimSpace(raw)) == 0 {
-		return nil, errInvalidParameter("request body must be a JSON object")
+		return nil, nil
 	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	// UseNumber keeps every JSON number as its literal text so integer
-	// fields (port) can be parsed exactly, without the float64 rounding
-	// that json.Unmarshal would apply.
-	decoder.UseNumber()
-	var body map[string]any
-	if err := decoder.Decode(&body); err != nil || body == nil {
-		return nil, errInvalidParameter("request body must be a JSON object")
-	}
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); err != io.EOF {
+	body, ok := decodeSingleJSONObject(raw)
+	if !ok {
 		return nil, errInvalidParameter("request body must be a single JSON object")
+	}
+	return body, nil
+}
+
+// readStrictObjectBody requires the body to be exactly one JSON object
+// surrounded only by JSON whitespace. It is used by the batch entries whose
+// contract forbids query-parameter merging: a missing/empty body, a JSON
+// null, array or other bare value, a second JSON value, or a stray closing
+// bracket after the object are all parameter errors, even when the first
+// object carries complete, valid entries.
+func readStrictObjectBody(c *gin.Context) (map[string]any, *apiError) {
+	body, apiErr := readOptionalObjectBody(c)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	if body == nil {
+		return nil, errInvalidParameter("request body must be a JSON object")
 	}
 	return body, nil
 }
