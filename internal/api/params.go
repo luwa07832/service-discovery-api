@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -76,7 +77,15 @@ func buildParamBag(c *gin.Context) (*paramBag, *apiError) {
 		}
 		if len(bytes.TrimSpace(raw)) > 0 {
 			var body map[string]any
-			if err := json.Unmarshal(raw, &body); err != nil {
+			// UseNumber keeps every JSON number as its literal text so
+			// integer fields (port) can be parsed exactly, without the
+			// float64 rounding that json.Unmarshal would apply.
+			decoder := json.NewDecoder(bytes.NewReader(raw))
+			decoder.UseNumber()
+			if err := decoder.Decode(&body); err != nil {
+				return nil, errInvalidParameter("request body must be a JSON object")
+			}
+			if decoder.More() {
 				return nil, errInvalidParameter("request body must be a JSON object")
 			}
 			for key, value := range body {
@@ -210,14 +219,108 @@ func positiveNumber(value any) (float64, bool) {
 	return number, true
 }
 
-// parsePortValue accepts a non-negative integer port number.
+// parsePortValue accepts a non-negative integer port number in the range
+// [0, 9223372036854775807]. JSON numbers and numeric strings are parsed from
+// their decimal text with exact integer semantics: values above 2^53 keep
+// their exact value, fractional forms such as 8080.0 or 8.08e3 collapse to
+// their integer value, and the int64 bound is enforced without rounding, so
+// 9223372036854775808 is rejected instead of overflowing the conversion.
 func parsePortValue(value any) (int64, bool) {
-	number, ok := toFloat(value)
-	if !ok || math.IsNaN(number) || math.IsInf(number, 0) || number < 0 ||
-		number != math.Trunc(number) || number > math.MaxInt64 {
+	switch typed := value.(type) {
+	case json.Number:
+		return parsePortText(typed.String())
+	case string:
+		return parsePortText(strings.TrimSpace(typed))
+	case float64:
+		// A float64 at or beyond 2^63 cannot be a valid port: the largest
+		// exactly representable candidate below it is 2^63-1024, and the
+		// int64 conversion of anything larger would overflow.
+		if math.IsNaN(typed) || math.IsInf(typed, 0) || typed != math.Trunc(typed) ||
+			typed < 0 || typed >= 9223372036854775808.0 {
+			return 0, false
+		}
+		return int64(typed), true
+	case int:
+		return int64(typed), typed >= 0
+	case int64:
+		return typed, typed >= 0
+	default:
 		return 0, false
 	}
-	return int64(number), true
+}
+
+// portNumberPattern is the decimal grammar a port may use: an integer or a
+// fixed/scientific decimal with an optional sign.
+var portNumberPattern = regexp.MustCompile(`^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$`)
+
+// parsePortText parses the exact integer value of a decimal number without
+// going through float64. The mantissa is kept as a digit string and the
+// exponent as a small int, so huge exponents are rejected by digit counting
+// instead of materializing enormous integers.
+func parsePortText(text string) (int64, bool) {
+	// Fast path: a plain decimal integer, exact for the whole int64 range.
+	if number, err := strconv.ParseInt(text, 10, 64); err == nil {
+		return number, number >= 0
+	}
+	if !portNumberPattern.MatchString(text) {
+		return 0, false
+	}
+	negative := strings.HasPrefix(text, "-")
+	mantissa := strings.TrimLeft(text, "+-")
+	exponent := 0
+	if at := strings.IndexAny(mantissa, "eE"); at >= 0 {
+		expText := mantissa[at+1:]
+		mantissa = mantissa[:at]
+		if digits := strings.TrimLeft(strings.TrimLeft(expText, "+-"), "0"); len(digits) > 6 {
+			// |exponent| >= 10^6: the value is either far beyond the int64
+			// bound or far below one; only an all-zero mantissa is still
+			// exactly zero.
+			if allZeroDigits(mantissa) {
+				return 0, true
+			}
+			return 0, false
+		}
+		exponent, _ = strconv.Atoi(expText)
+	}
+	intPart, fracPart := mantissa, ""
+	if at := strings.IndexByte(mantissa, '.'); at >= 0 {
+		intPart, fracPart = mantissa[:at], mantissa[at+1:]
+	}
+	// value = digits * 10^k
+	digits := intPart + fracPart
+	k := exponent - len(fracPart)
+	digits = strings.TrimLeft(digits, "0")
+	for strings.HasSuffix(digits, "0") {
+		digits = digits[:len(digits)-1]
+		k++
+	}
+	if digits == "" {
+		return 0, true // exact zero, in any form
+	}
+	if negative || k < 0 {
+		// A negative port is out of range; a negative remaining exponent
+		// leaves a fractional part, so the value is not an integer.
+		return 0, false
+	}
+	if len(digits)+k > 19 {
+		return 0, false
+	}
+	number, err := strconv.ParseInt(digits+strings.Repeat("0", k), 10, 64)
+	if err != nil {
+		return 0, false // 19 digits but beyond math.MaxInt64
+	}
+	return number, true
+}
+
+// allZeroDigits reports whether a mantissa (digits with an optional dot)
+// denotes zero.
+func allZeroDigits(mantissa string) bool {
+	for _, r := range mantissa {
+		if r != '0' && r != '.' {
+			return false
+		}
+	}
+	return true
 }
 
 // strictBoolValue accepts only JSON boolean true or false. Every other
@@ -262,6 +365,15 @@ func parseHealthValue(value any) (bool, bool) {
 			return true, true
 		case 0:
 			return false, true
+		}
+	case json.Number:
+		if number, err := typed.Float64(); err == nil {
+			switch number {
+			case 1:
+				return true, true
+			case 0:
+				return false, true
+			}
 		}
 	case string:
 		switch strings.ToLower(strings.TrimSpace(typed)) {
@@ -308,6 +420,12 @@ func parseTimeValue(value any) (time.Time, bool) {
 		}
 	case float64:
 		return unixTimeInRange(typed)
+	case json.Number:
+		number, err := typed.Float64()
+		if err != nil {
+			return time.Time{}, false
+		}
+		return unixTimeInRange(number)
 	}
 	return time.Time{}, false
 }
@@ -340,6 +458,12 @@ func parseTimeout(value any) (time.Duration, bool) {
 			return 0, false
 		}
 		return time.Duration(typed * float64(time.Second)), true
+	case json.Number:
+		number, err := typed.Float64()
+		if err != nil || math.IsNaN(number) || math.IsInf(number, 0) {
+			return 0, false
+		}
+		return time.Duration(number * float64(time.Second)), true
 	case string:
 		text := strings.TrimSpace(typed)
 		if text == "" {

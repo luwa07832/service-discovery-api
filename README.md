@@ -88,7 +88,7 @@ go run .
 
 - `service_name`、`instance_id`：必填非空。
 - `address`：访问地址，可选，默认空字符串。
-- `port`：端口，可选的非负整数，缺省为 `0`。
+- `port`：端口，可选的非负整数（`0` 到 `9223372036854775807`，含端点），缺省为 `0`。
 - `healthy`：健康状态，显式设置时只接受布尔 `true` 或 `false`，其他取值返回 `invalid_parameter`，缺省按 `false` 处理。
 - `weight`：权重，必填且必须大于 0（JSON 数字或数字字符串），小于等于 0 返回 `invalid_parameter` 且原记录不变。
 - `heartbeat_at`：心跳时间，必填，接受 RFC3339 时间或 Unix 秒。
@@ -100,7 +100,8 @@ go run .
 
 一次请求登记或覆盖同一服务下多个实例，请求体为单个 JSON 对象并含非空 `instances`
 数组；数组每项沿用单实例注册的字段语义：`instance_id` 必填非空且同批不得重复，
-`address` 缺省空字符串，`port` 缺省 `0` 且仅接受非负整数，`healthy` 缺省 `false`
+`address` 缺省空字符串，`port` 缺省 `0` 且仅接受 `0` 到
+`9223372036854775807`（含端点）的整数，`healthy` 缺省 `false`
 且仅接受布尔 `true`/`false`，`weight` 必填且大于 0（JSON 数字或数字字符串），
 `heartbeat_at` 必填，接受 RFC3339 时间或 Unix 秒。
 
