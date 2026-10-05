@@ -99,7 +99,7 @@ go run .
 - `POST /api/v1/register/batch`（服务名取请求体的 `service_name`）
 
 一次请求登记或覆盖同一服务下多个实例，请求体为单个 JSON 对象并含非空 `instances`
-数组；数组每项沿用单实例注册的字段语义：`instance_id` 必填非空且同批不得重复，
+数组；对象之外只允许出现 JSON 空白，不合并查询参数。数组每项沿用单实例注册的字段语义：`instance_id` 必填非空且同批不得重复，
 `address` 缺省空字符串，`port` 缺省 `0` 且仅接受 `0` 到
 `9223372036854775807`（含端点）的整数，`healthy` 缺省 `false`
 且仅接受布尔 `true`/`false`，`weight` 必填且大于 0（JSON 数字或数字字符串），
@@ -130,10 +130,12 @@ HTTP 200：`service_name` 为所属服务名，`registered` 为成功处理条�
 }
 ```
 
-写入前校验全部条目：请求体不是单个 JSON 对象、`instances` 缺失或为空、
+写入前校验全部条目：空正文、纯空白、`null`、数组或其他裸值、请求体不是
+单个 JSON 对象（包括对象结束后紧接或隔着空白出现多余的 `}`、`]`、第二个
+JSON 值或其他非空白内容）、`instances` 缺失或为空、
 任一条目缺少或重复 `instance_id`，或 `port`、`healthy`、`weight`、
 `heartbeat_at` 不合规，均返回 HTTP 400 `invalid_parameter` 单个顶层 `error`
-对象，且不创建、不更新任何实例。整批存储失败返回 HTTP 503
+对象，且不创建、不更新任何实例；这些情况都不能通过查询参数补救。整批存储失败返回 HTTP 503
 `storage_unavailable`，整批回滚、不留下部分更新。批量注册不触发失联清理，
 也不改变请求之外的任何实例记录。
 
@@ -229,7 +231,8 @@ HTTP 200：`service_name` 为所属服务名，`registered` 为成功处理条�
 {"instance":{"service_name":"billing","instance_id":"i-1","address":"10.0.0.8:8080","port":8080,"healthy":true,"weight":20,"heartbeat_at":"2026-10-01T12:00:00Z"}}
 ```
 
-批量请求体是单个 JSON 对象，`updates` 为非空数组；每项含 `instance_id`
+批量请求体是单个 JSON 对象，对象之外只允许出现 JSON 空白，不读取查询参数；
+`updates` 为非空数组；每项含 `instance_id`
 与 `weight`，同批 `instance_id` 不得重复：
 
 ```json
@@ -255,10 +258,13 @@ HTTP 200：`service_name` 为所属服务名，`registered` 为成功处理条�
 }
 ```
 
-请求体不是单个 JSON 对象、服务名或实例标识为空、`weight` 缺失、不可解析、
+空正文、纯空白、`null`、数组或其他裸值、请求体不是
+单个 JSON 对象（包括对象结束后紧接或隔着空白出现多余的 `}`、`]`、第二个
+JSON 值或其他非空白内容）、服务名或实例标识为空、`weight` 缺失、不可解析、
 非有限值或不大于 0，以及批量的 `updates` 缺失、为空、不是数组、条目不是
 对象、缺少 `instance_id` 或同批重复，均返回 HTTP 400 `invalid_parameter`
-且不修改任何记录。目标实例不存在时（单实例或批量中的任一条目）返回
+且不修改任何记录；批量入口的这些情况都不能通过查询参数补救（单实例权重
+入口从查询参数读取 `weight` 的既有规则不变）。目标实例不存在时（单实例或批量中的任一条目）返回
 HTTP 404 `instance_not_found`，批量整批不生效；存储失败返回 HTTP 503
 `storage_unavailable`，不留下部分更新。修改后权重查询
 （`GET .../instances/{instanceId}/weight`）与发现结果继续按权重降序、

@@ -100,6 +100,66 @@ func buildParamBag(c *gin.Context) (*paramBag, *apiError) {
 	return bag, nil
 }
 
+// readStrictObjectBody requires the body to be exactly one JSON object
+// surrounded only by JSON whitespace. It is used by the batch entries whose
+// contract forbids query-parameter merging: a missing/empty body, a JSON
+// null, array or other bare value, a second JSON value, or a stray closing
+// bracket after the object are all parameter errors, even when the first
+// object carries complete, valid entries.
+//
+// Decoder.More cannot be used to check completeness: it reports false for a
+// dangling "}" or "]" because those are not value tokens. A second Decode
+// must therefore return exactly io.EOF, which is true only once the object
+// has ended and nothing but whitespace remains.
+func readStrictObjectBody(c *gin.Context) (map[string]any, *apiError) {
+	if c.Request.Body == nil {
+		return nil, errInvalidParameter("request body must be a JSON object")
+	}
+	raw, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return nil, errInvalidParameter("request body cannot be read")
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, errInvalidParameter("request body must be a JSON object")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	// UseNumber keeps every JSON number as its literal text so integer
+	// fields (port) can be parsed exactly, without the float64 rounding
+	// that json.Unmarshal would apply.
+	decoder.UseNumber()
+	var body map[string]any
+	if err := decoder.Decode(&body); err != nil || body == nil {
+		return nil, errInvalidParameter("request body must be a JSON object")
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, errInvalidParameter("request body must be a single JSON object")
+	}
+	return body, nil
+}
+
+// buildStrictObjectBag is a paramBag populated from exactly one JSON object:
+// unlike buildParamBag it never reads query parameters, so a rejected or
+// missing body field cannot be repaired through the URL. Path parameters are
+// still recorded so path locators keep winning.
+func buildStrictObjectBag(c *gin.Context) (*paramBag, *apiError) {
+	body, apiErr := readStrictObjectBody(c)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	bag := &paramBag{
+		values: make(map[string]any, len(body)),
+		path:   make(map[string]any),
+	}
+	for key, value := range body {
+		bag.values[key] = value
+	}
+	for _, param := range c.Params {
+		bag.path[param.Key] = param.Value
+	}
+	return bag, nil
+}
+
 func (b *paramBag) get(keys []string) (any, bool) {
 	for _, key := range keys {
 		if value, ok := b.values[key]; ok {
