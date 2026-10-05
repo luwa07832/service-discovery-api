@@ -252,6 +252,17 @@ func parseHealthValue(value any) (bool, bool) {
 	return false, false
 }
 
+// Accepted time values must convert to a UTC instant in the half-open range
+// [0000-01-01T00:00:00Z, 10000-01-01T00:00:00Z): the span the RFC3339 storage
+// format can write and read back. The lower bound is inclusive, the upper
+// bound is exclusive.
+var (
+	earliestTime     = time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC)
+	latestTime       = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+	earliestTimeUnix = float64(earliestTime.Unix())
+	latestTimeUnix   = float64(latestTime.Unix())
+)
+
 func parseTimeValue(value any) (time.Time, bool) {
 	switch typed := value.(type) {
 	case string:
@@ -260,17 +271,43 @@ func parseTimeValue(value any) (time.Time, bool) {
 			return time.Time{}, false
 		}
 		if number, err := strconv.ParseFloat(text, 64); err == nil {
-			return unixTime(number), true
+			return unixTimeInRange(number)
 		}
 		for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05", "2006-01-02 15:04:05"} {
 			if parsed, err := time.Parse(layout, text); err == nil {
-				return parsed, true
+				return timeInRange(parsed)
 			}
 		}
 	case float64:
-		return unixTime(typed), true
+		return unixTimeInRange(typed)
 	}
 	return time.Time{}, false
+}
+
+// timeInRange accepts a parsed time only when its UTC instant lies inside
+// [earliestTime, latestTime). Offset times are judged by the UTC moment they
+// denote, not by their local wall clock.
+func timeInRange(parsed time.Time) (time.Time, bool) {
+	utc := parsed.UTC()
+	if utc.Before(earliestTime) || !utc.Before(latestTime) {
+		return time.Time{}, false
+	}
+	return utc, true
+}
+
+// unixTimeInRange accepts finite Unix seconds whose UTC instant lies inside
+// [earliestTime, latestTime). The range is checked on the float before any
+// integer conversion, so out-of-range magnitudes can never overflow int64
+// and wrap back into a legal date. Negative values remain valid down to the
+// lower bound, keeping pre-epoch instants such as -0.25 representable.
+func unixTimeInRange(seconds float64) (time.Time, bool) {
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+		return time.Time{}, false
+	}
+	if seconds < earliestTimeUnix || seconds >= latestTimeUnix {
+		return time.Time{}, false
+	}
+	return unixTime(seconds), true
 }
 
 func unixTime(seconds float64) time.Time {
