@@ -50,6 +50,29 @@ func writeError(c *gin.Context, e *apiError) {
 	c.JSON(e.status, gin.H{"error": gin.H{"code": e.code, "message": e.message}})
 }
 
+// trimJSONWhitespace removes only the JSON whitespace characters U+0020
+// space, U+0009 tab, U+000A line feed and U+000D carriage return from both
+// ends. bytes.TrimSpace must not be used here: it trims every Unicode
+// whitespace, so a body of NBSP (U+00A0), em space (U+2003), ideographic
+// space (U+3000), U+000B or U+000C would be mistaken for an empty body and
+// silently fall back to query parameters even though JSON parsers reject
+// those bytes outside a string. Whitespace that is legal only inside JSON
+// strings is untouched there, since this scans only the document framing.
+func trimJSONWhitespace(raw []byte) []byte {
+	start, end := 0, len(raw)
+	for start < end && isJSONWhitespace(raw[start]) {
+		start++
+	}
+	for end > start && isJSONWhitespace(raw[end-1]) {
+		end--
+	}
+	return raw[start:end]
+}
+
+func isJSONWhitespace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
 // paramBag merges JSON body fields and query parameters, keeping route path
 // parameters separate. Body fields win over query parameters; path
 // parameters are read through locateText and win over both of them.
@@ -74,9 +97,11 @@ func buildParamBag(c *gin.Context) (*paramBag, *apiError) {
 	// JSON whitespace: a null, array or other bare value, a truncated object,
 	// a second JSON value or a stray closing bracket are all parameter
 	// errors, even when the query parameters alone would complete the
-	// request. An empty or whitespace-only body carries no fields, so the
-	// query-parameter lookup rules still apply; an empty {} object merges
-	// with query parameters like any other (empty) field set.
+	// request. An empty body, or one made only of the four JSON whitespace
+	// bytes (space, tab, line feed, carriage return), carries no fields, so
+	// the query-parameter lookup rules still apply; other Unicode whitespace
+	// such as NBSP is not JSON whitespace and is rejected. An empty {}
+	// object merges with query parameters like any other (empty) field set.
 	if c.Request.Body != nil {
 		body, present, apiErr := readOptionalObjectBody(c)
 		if apiErr != nil {
@@ -97,16 +122,18 @@ func buildParamBag(c *gin.Context) (*paramBag, *apiError) {
 
 // decodeSingleJSONObject decodes raw as exactly one complete JSON object
 // surrounded only by JSON whitespace. It returns present=false for an empty
-// or whitespace-only payload. A JSON null, array or other bare value, a
-// truncated object, a second JSON value, or a stray closing bracket after
-// the object (immediately or across whitespace) are all parameter errors.
+// payload or one containing only JSON whitespace bytes; payloads of other
+// Unicode whitespace are not empty and fall through to the decoder, which
+// rejects them. A JSON null, array or other bare value, a truncated object,
+// a second JSON value, or a stray closing bracket after the object
+// (immediately or across whitespace) are all parameter errors.
 //
 // Decoder.More cannot be used to check completeness: it reports false for a
 // dangling "}" or "]" because those are not value tokens. A second Decode
 // must therefore return exactly io.EOF, which is true only once the object
 // has ended and nothing but whitespace remains.
 func decodeSingleJSONObject(raw []byte) (body map[string]any, present bool, apiErr *apiError) {
-	if len(bytes.TrimSpace(raw)) == 0 {
+	if len(trimJSONWhitespace(raw)) == 0 {
 		return nil, false, nil
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -126,9 +153,9 @@ func decodeSingleJSONObject(raw []byte) (body map[string]any, present bool, apiE
 }
 
 // readOptionalObjectBody reads a body that may be absent: no body or only
-// JSON whitespace yields present=false so the entry falls back to its query
-// parameter rules, while every non-empty non-object payload is a parameter
-// error.
+// the four JSON whitespace bytes yields present=false so the entry falls
+// back to its query parameter rules, while every other non-empty payload
+// (including other Unicode whitespace such as NBSP) is a parameter error.
 func readOptionalObjectBody(c *gin.Context) (map[string]any, bool, *apiError) {
 	if c.Request.Body == nil {
 		return nil, false, nil
@@ -213,9 +240,11 @@ func (b *paramBag) locateText(pathKey string, keys []string, message string) (st
 }
 
 // readJSONObject requires the request body to be a single JSON object. An
-// empty body, a JSON array or any non-object payload is a parameter error.
-// It is used by the batch entry points whose contract forbids merging query
-// parameters or accepting a bare value.
+// empty body, a body of only JSON whitespace bytes, a JSON array or any
+// non-object payload is a parameter error; other Unicode whitespace such as
+// NBSP is likewise rejected by the parser. It is used by the batch entry
+// points whose contract forbids merging query parameters or accepting a bare
+// value.
 func readJSONObject(c *gin.Context) (map[string]any, *apiError) {
 	if c.Request.Body == nil {
 		return nil, errInvalidParameter("request body must be a JSON object")
@@ -224,7 +253,7 @@ func readJSONObject(c *gin.Context) (map[string]any, *apiError) {
 	if err != nil {
 		return nil, errInvalidParameter("request body cannot be read")
 	}
-	if len(bytes.TrimSpace(raw)) == 0 {
+	if len(trimJSONWhitespace(raw)) == 0 {
 		return nil, errInvalidParameter("request body must be a JSON object")
 	}
 	var body map[string]any
@@ -245,7 +274,10 @@ func stringValue(value any) string {
 // JSON body field ("healthy": true|false) or the ?healthy=true|false query
 // parameter. The JSON field wins when both carry it. JSON accepts only
 // booleans, while the query parameter accepts only the lowercase text "true"
-// or "false"; every other representation is a parameter error.
+// or "false"; every other representation is a parameter error. As on every
+// other entry, only an absent body or one made solely of the four JSON
+// whitespace bytes falls back to the query parameter; other Unicode
+// whitespace makes the body a parameter error.
 func readHealthyInput(c *gin.Context) (bool, *apiError) {
 	queryValue, queryPresent := c.GetQuery("healthy")
 
@@ -254,7 +286,7 @@ func readHealthyInput(c *gin.Context) (bool, *apiError) {
 		if err != nil {
 			return false, errInvalidParameter("request body cannot be read")
 		}
-		if len(bytes.TrimSpace(raw)) > 0 {
+		if len(trimJSONWhitespace(raw)) > 0 {
 			var body map[string]any
 			if err := json.Unmarshal(raw, &body); err != nil || body == nil {
 				return false, errInvalidParameter("request body must be a JSON object")
