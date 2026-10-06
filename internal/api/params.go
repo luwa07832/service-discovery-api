@@ -95,18 +95,49 @@ func buildParamBag(c *gin.Context) (*paramBag, *apiError) {
 	return bag, nil
 }
 
+// isJSONWhitespaceByte reports whether b is one of the four whitespace
+// characters JSON permits outside tokens: U+0020 space, U+0009 tab, U+000A
+// line feed and U+000D carriage return. Every other byte is body content;
+// in particular U+000B, U+000C, U+00A0, U+2003 and U+3000 are not trimmed
+// here even though unicode.IsSpace (used by bytes.TrimSpace) treats them as
+// whitespace.
+func isJSONWhitespaceByte(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r':
+		return true
+	}
+	return false
+}
+
+// bodyIsJSONWhitespace reports whether raw is empty or contains only the
+// four JSON whitespace bytes. A payload carrying any other byte, such as a
+// vertical tab, form feed, no-break space, em space or ideographic space,
+// is a present (and, outside a JSON string, invalid) body.
+func bodyIsJSONWhitespace(raw []byte) bool {
+	for _, b := range raw {
+		if !isJSONWhitespaceByte(b) {
+			return false
+		}
+	}
+	return true
+}
+
 // decodeSingleJSONObject decodes raw as exactly one complete JSON object
 // surrounded only by JSON whitespace. It returns present=false for an empty
-// or whitespace-only payload. A JSON null, array or other bare value, a
-// truncated object, a second JSON value, or a stray closing bracket after
-// the object (immediately or across whitespace) are all parameter errors.
+// payload or one containing only JSON whitespace. Any other payload is
+// present: a JSON null, array or other bare value, a truncated object, a
+// second JSON value, a stray closing bracket after the object (immediately
+// or across whitespace), or a body whose padding includes non-JSON
+// whitespace such as U+000B, U+000C, U+00A0, U+2003 or U+3000 are all
+// parameter errors. Such characters stay legal inside JSON strings, where
+// the decoder consumes them as string content.
 //
 // Decoder.More cannot be used to check completeness: it reports false for a
 // dangling "}" or "]" because those are not value tokens. A second Decode
 // must therefore return exactly io.EOF, which is true only once the object
 // has ended and nothing but whitespace remains.
 func decodeSingleJSONObject(raw []byte) (body map[string]any, present bool, apiErr *apiError) {
-	if len(bytes.TrimSpace(raw)) == 0 {
+	if bodyIsJSONWhitespace(raw) {
 		return nil, false, nil
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -213,9 +244,11 @@ func (b *paramBag) locateText(pathKey string, keys []string, message string) (st
 }
 
 // readJSONObject requires the request body to be a single JSON object. An
-// empty body, a JSON array or any non-object payload is a parameter error.
-// It is used by the batch entry points whose contract forbids merging query
-// parameters or accepting a bare value.
+// empty body, a body containing only JSON whitespace, a JSON array or any
+// non-object payload is a parameter error; padding made of non-JSON
+// whitespace such as U+000B, U+000C, U+00A0, U+2003 or U+3000 is rejected
+// too. It is used by the batch entry points whose contract forbids merging
+// query parameters or accepting a bare value.
 func readJSONObject(c *gin.Context) (map[string]any, *apiError) {
 	if c.Request.Body == nil {
 		return nil, errInvalidParameter("request body must be a JSON object")
@@ -224,7 +257,7 @@ func readJSONObject(c *gin.Context) (map[string]any, *apiError) {
 	if err != nil {
 		return nil, errInvalidParameter("request body cannot be read")
 	}
-	if len(bytes.TrimSpace(raw)) == 0 {
+	if bodyIsJSONWhitespace(raw) {
 		return nil, errInvalidParameter("request body must be a JSON object")
 	}
 	var body map[string]any
@@ -245,7 +278,10 @@ func stringValue(value any) string {
 // JSON body field ("healthy": true|false) or the ?healthy=true|false query
 // parameter. The JSON field wins when both carry it. JSON accepts only
 // booleans, while the query parameter accepts only the lowercase text "true"
-// or "false"; every other representation is a parameter error.
+// or "false"; every other representation is a parameter error. A body
+// containing only JSON whitespace is treated as absent, while any other
+// non-empty body (including one padded with non-JSON whitespace such as
+// U+000B, U+000C, U+00A0, U+2003 or U+3000) must be one JSON object.
 func readHealthyInput(c *gin.Context) (bool, *apiError) {
 	queryValue, queryPresent := c.GetQuery("healthy")
 
@@ -254,7 +290,7 @@ func readHealthyInput(c *gin.Context) (bool, *apiError) {
 		if err != nil {
 			return false, errInvalidParameter("request body cannot be read")
 		}
-		if len(bytes.TrimSpace(raw)) > 0 {
+		if !bodyIsJSONWhitespace(raw) {
 			var body map[string]any
 			if err := json.Unmarshal(raw, &body); err != nil || body == nil {
 				return false, errInvalidParameter("request body must be a JSON object")
